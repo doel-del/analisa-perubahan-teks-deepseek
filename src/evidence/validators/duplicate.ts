@@ -595,23 +595,25 @@ function mergeClaims(claimA: string | undefined, claimB: string | undefined): st
   // Identik → pilih a
   if (na === nb) return a;
 
-  // Satu mengandung yang lain → pilih yang lebih panjang
+  // Satu mengandung yang lain → pilih yang lebih panjang (tanpa kehilangan info)
   if (na.includes(nb)) return a;
   if (nb.includes(na)) return b;
 
-  // Overlap kata signifikan → pilih yang lebih panjang
-  const wordsA = new Set(na.split(' ').filter(w => w.length > 3));
-  const wordsB = new Set(nb.split(' ').filter(w => w.length > 3));
-  const intersection = [...wordsA].filter(w => wordsB.has(w));
-  const overlapRatio =
-    intersection.length / Math.min(wordsA.size, wordsB.size || 1);
+  // Superset kata → pilih yang lebih panjang HANYA jika SEMUA token klaim
+  // yang lebih pendek ada di klaim yang lebih panjang. Tanpa filter panjang
+  // kata, agar subjek pendek (RAM/ROM/A26/5G) tidak diabaikan.
+  // Catatan: heuristik lama "overlap >= 50% -> pilih yang lebih panjang"
+  // dihapus karena membuang salah satu subjek pada pola
+  // SHARED_PREDICATE_DUPLICATE_SPLIT (klaim hanya beda di kata subjek).
+  const tokensA = new Set(na.split(' ').filter(Boolean));
+  const tokensB = new Set(nb.split(' ').filter(Boolean));
+  const [shorter, longer, longerText] =
+    tokensA.size <= tokensB.size ? [tokensA, tokensB, b] : [tokensB, tokensA, a];
+  if ([...shorter].every(t => longer.has(t))) return longerText;
 
-  if (overlapRatio >= 0.5) {
-    return a.length >= b.length ? a : b;
-  }
-
-  // Betul-betul berbeda → gabung dengan separator yang lebih baik
-  return `${a}. ${b}`;
+  // Informasi berbeda (mis. subjek berbeda) → gabung literal agar tidak ada
+  // subjek yang hilang. Titik akhir klaim pertama dibuang agar tidak ganda.
+  return `${a.replace(/[.\s]+$/, '')}. ${b}`;
 }
 
 function buildMergedEvidence(
