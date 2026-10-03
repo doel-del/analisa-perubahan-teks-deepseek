@@ -1,0 +1,1122 @@
+import express from 'express';
+import path from 'path';
+import { createServer as createViteServer } from 'vite';
+import fs from 'fs';
+import dotenv from 'dotenv';
+
+// Pasca E3.D
+import {
+  parseSRT,
+  buildEvidenceChunks,
+  buildChunkText,
+  //parseEvidenceJSON,
+  parseEvidenceJSONDetailed,
+  buildMetadataContext,
+  getReviewerName,
+  buildEvidenceInstruction,
+  PRODUCTION_SYSTEM_INSTRUCTION_EVIDENCE,
+  type ReviewMetadata
+} from './src/evidence/production-pipeline';
+import { buildSrtNlpSafeInstruction } from './src/prompts/srt-nlp-safe';
+
+// 🔥 IMPOR PROMPT BARU YANG SUDAH DIPISAH
+import {
+  ANALYSIS_PROMPT_SUMMARY,
+  ANALYSIS_PROMPT_EVIDENCE_A
+} from './prompts';
+
+// ==========================================
+// IMPOR VALIDATOR LAYER PHASE A & B
+// ==========================================
+import { EvidenceValidator } from './src/evidence/validators/evidence-validator';
+import { DuplicateValidator } from './src/evidence/validators/duplicate';
+import type { DuplicateResult } from './src/evidence/validators/duplicate';
+import type {
+  EvidenceContext,
+  EvidenceItem,
+  EvidenceValidationReport
+} from './src/evidence/types';
+import type { SRTSegment } from './src/evidence/srt';
+import {
+  buildChunkLocalKeys,
+  remapRelatedIds,
+  redirectRelatedIds
+} from './src/evidence/related-ids';
+import type { LocalKey, ChunkKeyDiagnostics } from './src/evidence/related-ids';
+import { normalizeForSearch } from './src/evidence/srt';
+
+// 📦 Impor unified LLM provider
+import {
+  callLLMAPI, 
+  callLLMWithFallback, 
+  getActiveProvider, 
+  getConfiguredKeyCount 
+} from './src/llm/llm-provider';
+
+// SRT POST-PROCESSOR
+import {
+  applyPostNormalize,
+  detectCrossSegmentDuplication
+} from './src/prompts/srt-post-process';
+
+
+dotenv.config();
+console.log(`🔑 Gemini keys discovered: ${getConfiguredKeyCount()}`);
+
+const app = express();
+const PORT = 3000;
+app.use(express.json({ limit: '10mb' }));
+
+// ==========================================
+// 1. TIPE DATA & KONFIGURASI TEMPLATE
+// ==========================================
+interface PromptTemplate {
+  id: string;
+  name: string;
+  instruction: string;
+}
+
+let PROMPT_TEMPLATES: PromptTemplate[] = [];
+try {
+  const templatesData = fs.readFileSync('./promptTemplates.json', 'utf8');
+  PROMPT_TEMPLATES = JSON.parse(templatesData) as PromptTemplate[];
+} catch (err) {
+  console.error('Gagal memuat promptTemplates.json:', err);
+}
+
+// Template dinamis dari protection-list.json
+const SRT_NLP_SAFE_TEMPLATE: PromptTemplate = {
+  id: 'srt_nlp_safe',
+  name: '🧬 SRT: NLP-Safe (Evidence-Ready)',
+  instruction: buildSrtNlpSafeInstruction()
+};
+
+// Guard: hindari duplikat kalau server hot-reload
+if (!PROMPT_TEMPLATES.some(t => t.id === SRT_NLP_SAFE_TEMPLATE.id)) {
+  PROMPT_TEMPLATES.push(SRT_NLP_SAFE_TEMPLATE);
+}
+
+console.log(`📋 Templates loaded: ${PROMPT_TEMPLATES.length}`);
+console.log(`   - ${PROMPT_TEMPLATES.map(t => t.id).join('\n   - ')}`);
+
+// ==========================================
+// 2. KONFIGURASI KAMUS / DICTIONARY
+// ==========================================
+const DICTIONARY_DIR = path.join(process.cwd(), 'dictionaries');
+if (!fs.existsSync(DICTIONARY_DIR)) {
+  fs.mkdirSync(DICTIONARY_DIR, { recursive: true });
+  console.log(`✅ Folder dictionaries berhasil dibuat di ${DICTIONARY_DIR}`);
+}
+
+function safeReadJSON(filePath: string): Record<string, string> {
+  if (!fs.existsSync(filePath)) { return {}; }
+  try {
+    const fileContent = fs.readFileSync(filePath, 'utf8');
+    if (!fileContent || fileContent.trim() === '') { return {}; }
+    return JSON.parse(fileContent);
+  } catch (err) {
+    console.warn(`⚠️ File JSON ${filePath} tidak valid atau rusak, mengabaikan dan memulai baru.`);
+    return {};
+  }
+}
+
+// ==========================================
+// 3. HELPER AI FUNCTIONS — SUDAH DIGANTI DENGAN UNIFIED LLM PROVIDER
+// ==========================================
+
+// ==========================================
+// FUNGSI GENERATE SUMMARY (TERPISAH)
+// ==========================================
+async function generateSummary(
+  srtContent: string,
+  metadata: ReviewMetadata = {},
+  reviewerName: string = 'Reviewer'
+): Promise<string> {
+  const segments = parseSRT(srtContent);
+  if (segments.length === 0) {
+    throw new Error('Format transcript.srt tidak valid atau tidak memiliki segment.');
+  }
+
+  const resolvedReviewerName = getReviewerName(metadata, reviewerName);
+  const metadataContext = buildMetadataContext(metadata);
+  const fullText = segments.map(seg => seg.text).join(' ');
+
+  const summaryInstruction =
+    `IDENTITAS REVIEW:\n${metadataContext || `Channel/Reviewer: ${resolvedReviewerName}`}\n\n` +
+    `SOURCE OF TRUTH: transcript.srt.\n` +
+    `Metadata hanya digunakan untuk identitas review dan konteks administratif.\n` +
+    `Jangan menggunakan metadata sebagai evidence isi produk.\n\n` +
+    ANALYSIS_PROMPT_SUMMARY;
+
+  // Primary = gemini, fallback = groq
+  const result = await callLLMWithFallback(
+    fullText,
+    summaryInstruction,
+    'Anda adalah perangkum produk yang objektif. Gunakan transcript sebagai satu-satunya sumber isi review.',
+    'gemini'
+  );
+
+  if (!result.success) {
+    throw new Error(result.error || 'Gagal mendapatkan summary dari LLM');
+  }
+  return result.content;
+}
+
+// ==========================================
+// FUNGSI EXTRACT EVIDENCE (TERPISAH)
+// ==========================================
+
+async function extractEvidence(
+  srtContent: string,
+  metadata: ReviewMetadata = {},
+  reviewerName: string = 'Reviewer'
+): Promise<{
+  evidence: EvidenceItem[];
+  quarantine: Array<{ evidence: EvidenceItem; reason?: string; chunkIndex: number }>;
+  duplicateRemoved: Array<{ evidence_id: string; reason: string; kept_evidence_id: string }>;
+  duplicateMerged: Array<{ evidence_id_a: string; evidence_id_b: string; merged_evidence_id: string; reason: string }>;
+  stats: {
+    parsedEvidenceCount: number;
+    structurallyInvalidCount: number;
+    validatorAcceptedCount: number;
+    quarantineCount: number;
+    duplicateRemovedCount: number;
+    duplicateMergedCount: number;
+    finalCount: number;
+    eligibleMultiCount: number;
+    resolvedMultiCount: number;
+    quarantineMultiCount: number;
+    multiResolutionRate: number | null;
+    multiQuarantineRate: number | null;
+    promptVersion: 'A';
+  };
+}> {
+  // Parse SRT
+  const segments = parseSRT(srtContent);
+  if (segments.length === 0) {
+    throw new Error('Format transcript.srt tidak valid atau tidak memiliki segment.');
+  }
+
+  const resolvedReviewerName = getReviewerName(metadata, reviewerName);
+  const metadataContext = buildMetadataContext(metadata);
+
+  // Chunking dengan ukuran lebih besar (18000 karakter) dan overlap 3 segmen
+  const evidenceChunks = buildEvidenceChunks(
+    segments,
+    Number(process.env.EVIDENCE_CHUNK_CHARS ?? 18000),
+    Number(process.env.EVIDENCE_CHUNK_OVERLAP ?? 3)
+  );
+  console.log(`📦 Evidence extraction akan menggunakan ${evidenceChunks.length} chunk.`);
+
+
+  let allEvidence: EvidenceItem[] = [];
+  // Array paralel dengan allEvidence (indeks sama): nomor LOKAL LLM tiap item
+  // yang lolos validasi. Dipakai untuk memetakan related_evidence_ids.
+  const allEvidenceKeys: LocalKey[] = [];
+  const chunkKeyDiagnostics: ChunkKeyDiagnostics[] = [];
+  // ==========================================================
+  // EXTRACTION TELEMETRY
+  // ==========================================================
+  // parsedEvidenceCount:
+  //   Semua item yang berhasil diparse dari output JSON LLM.
+  //
+  // structurallyInvalidCount:
+  //   Item hasil parse yang tidak memenuhi bentuk dasar evidence
+  //   (misalnya tidak memiliki claim string yang valid).
+  //
+  // validatorAcceptedCount:
+  //   Evidence yang lolos EvidenceValidator.
+  //
+  // quarantineCount:
+  //   Evidence yang berhasil diparse tetapi ditolak validator.
+  //
+  // Statistik ini sengaja dipisahkan dari duplicate gate.
+  // ==========================================================
+
+  let parsedEvidenceCount = 0;
+  let structurallyInvalidCount = 0;
+  let validatorAcceptedCount = 0;
+  let quarantineSequence = 0;
+  const quarantinedEvidence: Array<{
+    evidence: EvidenceItem;
+    reason?: string;
+    chunkIndex: number;
+  }> = [];
+  let eligibleMultiCount = 0;
+  let resolvedMultiCount = 0;
+  let quarantineMultiCount = 0;
+
+  // Loop per chunk
+  for (let chunkIndex = 0; chunkIndex < evidenceChunks.length; chunkIndex++) {
+    const chunk = evidenceChunks[chunkIndex];
+    const batchNumber = chunkIndex + 1;
+    const totalBatches = evidenceChunks.length;
+
+    const evidenceInstruction = buildEvidenceInstruction(
+      metadata,
+      reviewerName,
+      batchNumber,
+      totalBatches,
+      ANALYSIS_PROMPT_EVIDENCE_A
+    );
+
+    console.log(`📦 Mengekstrak Chunk Evidence ke-${batchNumber}/${totalBatches} ...`);
+
+    // 🔥 LOG RENTANG SEGMEN
+    const firstSegment = chunk[0];
+    const lastSegment = chunk[chunk.length - 1];
+    const totalSegments = chunk.length;
+    console.log(
+      `   📍 Segmen ${firstSegment.index} → ${lastSegment.index} ` +
+      `(${firstSegment.start} → ${lastSegment.end})`
+    );
+    console.log(`   📏 Jumlah segmen: ${totalSegments}`);
+
+    // 🔥 BUILD CHUNK TEXT DAN HITUNG KARAKTER
+    const chunkText = buildChunkText(chunk);
+    const charLength = chunkText.length;
+    console.log(`📏 Chunk ${batchNumber} - Karakter: ${charLength}, Estimasi Token: ~${Math.ceil(charLength / 4)}`);
+
+    try {
+      const result = await callLLMWithFallback(
+        chunkText,
+        evidenceInstruction,
+        PRODUCTION_SYSTEM_INSTRUCTION_EVIDENCE,
+        'gemini'
+      );
+
+      if (!result.success) {
+        throw new Error(result.error || 'Gagal mengekstrak evidence dari LLM');
+      }
+
+      const rawOutput = result.content;
+      // const chunkEvidence = parseEvidenceJSON(rawOutput);
+      // Pakai versi detailed agar strategi fallback yang berhasil bisa
+      // dilog. Perilaku parsing IDENTIK dengan parseEvidenceJSON --
+      // parseEvidenceJSONDetailed memanggil core yang sama (lihat
+      // production-pipeline.ts) -- ini murni menambah observability.
+      const parsedResult = parseEvidenceJSONDetailed(rawOutput);
+      const chunkEvidence = parsedResult.evidence as EvidenceItem[];
+
+      // Nomor lokal LLM dihitung dari SEMUA item hasil parse, sebelum filter
+      // struktural/validator, karena LLM menomori urutan keluarannya sendiri.
+      const { keys: chunkKeys, diagnostics: chunkKeyDiag } =
+        buildChunkLocalKeys(chunkEvidence as any[], chunkIndex);
+      chunkKeyDiagnostics.push(chunkKeyDiag);
+      console.log(
+        `   🔢 Chunk ${chunkIndex + 1}: ${chunkKeyDiag.totalParsed} item parse, nomor lokal ` +
+        `${chunkKeyDiag.idRange ? chunkKeyDiag.idRange.join('..') : '-'} [${chunkKeyDiag.mode}/${chunkKeyDiag.reason}]`
+      );
+      if (chunkKeyDiag.mode === 'position') {
+        console.warn(
+          `⚠️ Chunk ${chunkIndex + 1}: nomor lokal memakai posisi (alasan: ${chunkKeyDiag.reason}, ` +
+          `id hilang: ${chunkKeyDiag.missingIds}, id ganda: ${chunkKeyDiag.duplicateIds.join(',') || '-'})`
+        );
+      }
+      const keyByEv = new Map<unknown, LocalKey>();
+      chunkEvidence.forEach((e, i) => keyByEv.set(e, chunkKeys[i]));
+
+      // Semua item yang berhasil diparse dari JSON LLM.
+      parsedEvidenceCount += chunkEvidence.length;
+
+      // Validitas struktural saja.
+      // Ini BELUM berarti evidence lolos EvidenceValidator.
+      const structurallyValidEvidence =
+        chunkEvidence.filter(isValidEvidence);
+
+      structurallyInvalidCount +=
+        chunkEvidence.length - structurallyValidEvidence.length;
+
+      if (structurallyValidEvidence.length === 0) {
+        console.log(`⚠️ Chunk ke-${batchNumber} tidak menghasilkan evidence valid.`);
+        continue;
+      }
+
+      for (const ev of structurallyValidEvidence) {
+        const context: EvidenceContext = {
+          chunkIndex,
+          chunkText,
+          chunkSegments: chunk
+        };
+
+        // ▼ Auto-reconcile sebelum validasi
+        const reconciledEv = reconcileTypeWithAssessment(ev);
+
+        function reconcileTypeWithAssessment(ev: EvidenceItem): EvidenceItem {
+          const hasAssessment =
+            ev.reviewer_assessment !== null &&
+            ev.reviewer_assessment !== undefined &&
+            String(ev.reviewer_assessment).trim() !== '';
+
+          const normalizedType = (ev.type || '').toUpperCase();
+
+          if (hasAssessment && normalizedType !== 'OPINION') {
+            console.warn(
+              `🔧 Auto-upgrade type: ${normalizedType} → OPINION ` +
+              `(assessment="${ev.reviewer_assessment}" filled but type was non-OPINION). ` +
+              `Claim: "${ev.claim}"`
+            );
+            return { ...ev, type: 'OPINION' };
+          }
+          return ev;
+        }
+
+        // const report: EvidenceValidationReport = EvidenceValidator.validate(ev, context);
+        const report: EvidenceValidationReport = EvidenceValidator.validate(reconciledEv, context);
+
+        // Normalisasi simetris kedua sisi (Concern 1)
+        const occCount = countOccurrences(
+          normalizeForSearch(ev.source_excerpt || ''),
+          normalizeForSearch(chunkText)
+        );
+
+        // eligible_multi dihitung sebelum accepted check (Concern 2, align Option X)
+        const isMulti = occCount >= 2;
+        if (isMulti) eligibleMultiCount++;
+
+        if (report.accepted) {
+          validatorAcceptedCount++;
+
+          allEvidence.push({
+            // ...ev,
+            ...reconciledEv,
+            validation: report
+          });
+          allEvidenceKeys.push(keyByEv.get(ev)!);
+          if (isMulti) {
+            const provenancePassed = report.results.some(
+              r => r.rule === 'PROVENANCE' && r.status === 'PASS'
+            );
+            if (provenancePassed) resolvedMultiCount++;
+          }
+        } else {
+          quarantineSequence++;
+          quarantinedEvidence.push({
+            evidence: { ...ev, evidence_id: `Q${String(quarantineSequence).padStart(3, '0')}` },
+            reason: report.quarantineReason,
+            chunkIndex
+          });
+          if (isMulti) quarantineMultiCount++;
+        }
+      }  // ← INI YANG HILANG: tutup loop for (const ev of validEvidence)
+
+      console.log(`✅ Chunk ke-${batchNumber} selesai. Total valid: ${allEvidence.length}, Quarantine: ${quarantinedEvidence.length}`);
+    } catch (err) {
+      console.error(`❌ Gagal memproses Chunk ke-${batchNumber}:`, err);
+      continue;
+    }
+
+    // Jeda 5 detik agar tidak kena rate limit Groq (meskipun primary gemini, fallback tetap groq)
+    if (chunkIndex < evidenceChunks.length - 1) {
+      console.log(`⏳ Menunggu 5 detik sebelum chunk berikutnya...`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+  }
+
+  // ==========================================================
+  // STATISTICAL INVARIANT
+  // ==========================================================
+  // Semua structurally-valid parsed evidence harus berakhir
+  // tepat di salah satu dari dua jalur:
+  //   1. validator accepted
+  //   2. quarantine
+  //
+  // Jika invariant gagal, berarti ada evidence yang hilang
+  // di antara structural gate dan validator.
+  // ==========================================================
+
+  const validatorCandidateCount =
+    validatorAcceptedCount + quarantinedEvidence.length;
+
+  const expectedValidatorCandidateCount =
+    parsedEvidenceCount - structurallyInvalidCount;
+
+  if (validatorCandidateCount !== expectedValidatorCandidateCount) {
+    console.error(
+      `❌ STAT INVARIANT FAILED: ` +
+      `validator candidates=${validatorCandidateCount}, ` +
+      `expected=${expectedValidatorCandidateCount}, ` +
+      `parsed=${parsedEvidenceCount}, ` +
+      `structurallyInvalid=${structurallyInvalidCount}`
+    );
+  } else {
+    console.log(
+      `📊 Extraction invariant PASS: ` +
+      `${parsedEvidenceCount} parsed → ` +
+      `${structurallyInvalidCount} structurally invalid + ` +
+      `${validatorAcceptedCount} accepted + ` +
+      `${quarantinedEvidence.length} quarantine`
+    );
+  }
+
+  // Assign ID
+  // const identifiedEvidence = assignEvidenceIds(allEvidence, metadata.id ?? null);
+  const identifiedEvidenceRaw = assignEvidenceIds(allEvidence, metadata.id ?? null);
+
+  // Petakan related_evidence_ids (nomor lokal LLM) -> evidence_id final
+  const { evidence: identifiedEvidence, stats: relatedStats } =
+     remapRelatedIds(identifiedEvidenceRaw, allEvidenceKeys, chunkKeyDiagnostics);
+  console.log(
+    `🔗 related_evidence_ids: ${relatedStats.mapped}/${relatedStats.totalRefs} dipetakan, ` +
+    `dibuang: ${relatedStats.droppedUnknown} tak dikenal, ${relatedStats.droppedSelf} diri sendiri, ` +
+    `${relatedStats.droppedDuplicate} ganda | nomor lokal: ` +
+    `${relatedStats.chunksUsingLlmIds} chunk dari evidence_id LLM, ` +
+    `${relatedStats.chunksUsingPosition} chunk dari posisi`
+  );
+  for (const c of relatedStats.perChunk) {
+    console.log(
+      `   🔗 Chunk ${c.chunkIndex + 1} [${c.mode}/${c.reason}]: ${c.itemsAccepted} item, ` +
+      `${c.emitted} ref → ${c.mapped} dipetakan | dibuang: ${c.droppedTargetRemoved} ke item terbuang, ` +
+      `${c.droppedTargetNonexistent} nomor tak ada, ${c.droppedTargetUnclassified} tak terklasifikasi, ` +
+      `${c.droppedUnparseable} tak terbaca`
+    );
+    for (const sm of c.samples) {
+      console.log(`      · ${sm.from} → "${sm.ref}" (${sm.reason})`);
+    }
+  }
+  console.log(`🏷️ Evidence ID telah di-assign: ${identifiedEvidence.length} evidence.`);
+
+  // Duplicate Gate
+  const duplicateResult = DuplicateValidator.detect(identifiedEvidence);
+  const { preservedEvidence, duplicateRemovedDetails, duplicateMergedDetails } =
+    //resolveDuplicateActions(identifiedEvidence, duplicateResult);
+    resolveDuplicateActions(identifiedEvidence, duplicateResult, segments);
+
+  console.log(`🧹 Duplicate gate selesai: ${identifiedEvidence.length} -> ${preservedEvidence.length}`);
+
+  // Tambahkan timestamp & metadata
+  // const finalEvidence = preservedEvidence.map(ev => {
+  // Arahkan referensi yang menunjuk item duplikat/merge ke id final
+  const { evidence: relinkedEvidence, dropped: relatedDropped } =
+    redirectRelatedIds(preservedEvidence, duplicateRemovedDetails, duplicateMergedDetails);
+  if (relatedDropped > 0) {
+    console.log(`🔗 ${relatedDropped} referensi related_evidence_ids dibuang/diarahkan ulang setelah duplicate gate.`);
+  }
+
+  const finalEvidence = relinkedEvidence.map(ev => {
+    const timestamp = ev.source_coordinates
+      ? getTimestampFromCoordinates(ev.source_coordinates, segments)
+      : { timestamp_start: null, timestamp_end: null };
+
+    return {
+      ...ev,
+      timestamp_start: timestamp.timestamp_start,
+      timestamp_end: timestamp.timestamp_end,
+      source: resolvedReviewerName,
+      review_id: metadata.id ?? null,
+      video_url: metadata.url ?? null,
+      video_title: metadata.title ?? null
+    };
+  });
+
+  const duplicateRemovedCount = duplicateRemovedDetails.length;
+  const mergedCount = duplicateMergedDetails.length;
+
+  return {
+    evidence: finalEvidence,
+    quarantine: quarantinedEvidence,
+    duplicateRemoved: duplicateRemovedDetails,
+    duplicateMerged: duplicateMergedDetails,
+    stats: {
+      // ==========================================
+      // EXTRACTION FUNNEL
+      // ==========================================
+      parsedEvidenceCount,
+      structurallyInvalidCount,
+      validatorAcceptedCount,
+      quarantineCount: quarantinedEvidence.length,
+
+      // ==========================================
+      // DUPLICATE FUNNEL
+      // ==========================================
+      duplicateRemovedCount,
+      duplicateMergedCount: mergedCount,
+      finalCount: finalEvidence.length,
+
+      // ==========================================
+      // MULTI-OCCURRENCE TELEMETRY
+      // ==========================================
+      eligibleMultiCount: eligibleMultiCount,
+      resolvedMultiCount: resolvedMultiCount,
+      quarantineMultiCount: quarantineMultiCount,
+
+      multiResolutionRate:
+        eligibleMultiCount > 0
+          ? resolvedMultiCount / eligibleMultiCount
+          : null,
+
+      multiQuarantineRate:
+        eligibleMultiCount > 0
+          ? quarantineMultiCount / eligibleMultiCount
+          : null,
+
+      // ==========================================
+      // PRODUCTION PROMPT
+      // ==========================================
+      promptVersion: 'A' as const
+    }
+  };
+}
+
+// ==========================================
+// 4. API ROUTES (FITUR CLEANING & KAMUS)
+// ==========================================
+app.get('/api/templates', (req, res) => {
+  const templateList = PROMPT_TEMPLATES.map(({ id, name }) => ({ id, name }));
+  res.json(templateList);
+});
+
+app.post('/api/correct-text', async (req, res) => {
+  try {
+    const { text, mode, templateId, customInstruction } = req.body;
+    if (!text) return res.status(400).json({ error: 'Teks kosong' });
+
+    // 1. Resolve instruction
+    let promptInstruction = '';
+    if ((mode === 'custom' || mode === 'manual') && customInstruction) {
+      promptInstruction = customInstruction;
+    } else if (templateId) {
+      const tpl = PROMPT_TEMPLATES.find(t => t.id === templateId);
+      promptInstruction = tpl?.instruction ?? '';
+    }
+    if (!promptInstruction) {
+      return res.status(400).json({ error: 'Instruksi tidak ditemukan' });
+    }
+
+    // 2. Deteksi tipe input
+    const segments = parseSRT(text);
+    const isSRT = segments.length > 0;
+    const isSRTTemplate = typeof templateId === 'string' && templateId.startsWith('srt_');
+
+    // 3. Mismatch: template SRT tapi input bukan SRT
+    if (isSRTTemplate && !isSRT) {
+      return res.status(400).json({
+        error: 'Template SRT dipilih, tetapi input bukan format SRT. Pastikan input memiliki nomor segmen dan timestamp (00:00:00,000 --> 00:00:00,000).'
+      });
+    }
+
+    // 4. Jalur SRT: strip timestamp, kirim teks saja
+    if (isSRT) {
+      const textOnly = segments
+        .map(s => `[${s.index}] ${s.text.replace(/\n/g, ' ')}`)
+        .join('\n');
+
+      const systemInstruction = `Anda editor subtitle. Setiap baris dimulai dengan penanda [angka].
+Perbaiki HANYA teks setelah penanda. JANGAN ubah penanda [angka].
+JANGAN gabung, pecah, hapus, atau tambah baris.
+JANGAN tambahkan penjelasan, komentar, atau teks non-dialog.
+Output hanya baris dengan format: [angka] teks`;
+
+      const result = await callLLMAPI(textOnly, promptInstruction, systemInstruction, getActiveProvider());
+      if (!result.success) throw new Error(result.error);
+
+      // Parse balik
+      const fixedMap = new Map<number, string>();
+      for (const line of result.content.split('\n')) {
+        const m = line.match(/^\s*\[(\d+)\]\s*(.*)$/);
+        if (m) fixedMap.set(parseInt(m[1], 10), m[2].trim());
+      }
+
+      // Validasi: semua indeks asli harus ada, tidak ada yang hilang
+      const issues: string[] = [];
+      for (const s of segments) {
+        if (!fixedMap.has(s.index)) issues.push(`Segmen ${s.index} hilang dari output LLM`);
+      }
+      const extraIndices = [...fixedMap.keys()].filter(k => !segments.some(s => s.index === k));
+      if (extraIndices.length > 0) issues.push(`Indeks tidak dikenal: ${extraIndices.join(', ')}`);
+
+      if (issues.length > 0) {
+        return res.json({
+          success: false,
+          error: `Validasi SRT gagal:\n- ${issues.join('\n- ')}`,
+          correctedText: text,
+          issues,
+          mode
+        });
+      }
+
+      // ▼ LANGKAH BARU 1: bangun ulang dulu, lalu apply post-normalize
+      const rebuiltSegments: SRTSegment[] = segments.map(s => {
+        const rawFixed = fixedMap.get(s.index) ?? s.text;
+        return {
+          index: s.index,
+          start: s.start,
+          end: s.end,
+          text: applyPostNormalize(rawFixed)
+        };
+      });
+
+      // ▼ LANGKAH BARU 2: deteksi duplikasi antar-segmen
+      const dupIssues = detectCrossSegmentDuplication(rebuiltSegments);
+      if (dupIssues.length > 0) {
+        return res.json({
+          success: false,
+          error: `Duplikasi antar segmen terdeteksi:\n- ${dupIssues.join('\n- ')}`,
+          correctedText: text,
+          issues: dupIssues,
+          mode
+        });
+      }
+
+      const rebuilt = rebuiltSegments
+        .map(s => `${s.index}\n${s.start} --> ${s.end}\n${s.text}\n`)
+        .join('\n');
+
+      return res.json({ success: true, correctedText: rebuilt, mode });
+    }
+
+    // 5. Jalur teks biasa
+    const systemInstruction = `Anda editor teks. Perbaiki teks sesuai instruksi user. Output hanya teks hasil perbaikan, tanpa penjelasan tambahan.`;
+    const result = await callLLMAPI(text, promptInstruction, systemInstruction, getActiveProvider());
+    if (!result.success) throw new Error(result.error);
+
+    return res.json({ success: true, correctedText: result.content, mode });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/dictionary/:name', (req, res) => {
+  return res.json({});
+});
+
+
+// --------------------------------------------------
+// VALIDASI EVIDENCE DASAR
+// --------------------------------------------------
+
+export function isValidEvidence(ev: any): boolean {
+  if (
+    !ev ||
+    typeof ev !== 'object' ||
+    Array.isArray(ev)
+  ) {
+    return false;
+  }
+
+  return (
+    typeof ev.claim === 'string' &&
+    ev.claim.trim().length > 0
+  );
+}
+
+function countOccurrences(needle: string, haystack: string): number {
+  if (!needle || !haystack) return 0;
+  let count = 0;
+  let idx = 0;
+  while ((idx = haystack.indexOf(needle, idx)) !== -1) {
+    count++;
+    idx += needle.length;
+  }
+  return count;
+}
+
+// --------------------------------------------------
+// EVIDENCE ID
+// --------------------------------------------------
+
+export function assignEvidenceIds(
+  evidence: EvidenceItem[],
+  reviewId?: string | null
+): EvidenceItem[] {
+  const safeReviewId =
+    reviewId && /^[\w-]{3,}$/.test(reviewId) ? reviewId : null;
+
+  return evidence.map((ev, index) => {
+    const id = `E${String(index + 1).padStart(3, '0')}`;
+    return {
+      ...ev,
+      evidence_id: safeReviewId ? `${safeReviewId}-${id}` : id
+    };
+  });
+}
+
+// --------------------------------------------------
+// TIMESTAMP DARI SOURCE COORDINATES
+// --------------------------------------------------
+
+function getTimestampFromCoordinates(
+  coordinates: NonNullable<EvidenceItem['source_coordinates']>,
+  segments: SRTSegment[]
+): {
+  timestamp_start: string | null;
+  timestamp_end: string | null;
+} {
+  const startSegment = segments.find(
+    segment => segment.index === coordinates.segment_start_index
+  );
+
+  const endSegment = segments.find(
+    segment => segment.index === coordinates.segment_end_index
+  );
+
+  if (!startSegment || !endSegment) {
+    return {
+      timestamp_start: null,
+      timestamp_end: null
+    };
+  }
+
+  return {
+    timestamp_start: startSegment.start,
+    timestamp_end: endSegment.end
+  };
+}
+
+// --------------------------------------------------
+// RESOLUSI DUPLICATE GATE
+// --------------------------------------------------
+
+export interface DuplicateResolutionOutput {
+  preservedEvidence: EvidenceItem[];
+  duplicateRemovedDetails: Array<{
+    evidence_id: string;
+    reason: string;
+    kept_evidence_id: string;
+  }>;
+  duplicateMergedDetails: Array<{
+    evidence_id_a: string;
+    evidence_id_b: string;
+    merged_evidence_id: string;
+    reason: string;
+  }>;
+}
+
+// BARU: menerima `segments` (seluruh SRT, bukan hanya satu chunk) agar
+// merged evidence bisa dibangun ulang EvidenceContext-nya dan divalidasi
+// ulang lewat EvidenceValidator sebelum dianggap diterima. Tanpa ini,
+// merged evidence mewarisi `validation` mentah dari evidenceA (klaim
+// TUNGGAL, sudah PASS individual) padahal claim yang dipakai sekarang
+// adalah gabungan dua klaim -- persis bentuk yang seharusnya kena
+// ATOMICITY SUSPECT. Dikonfirmasi lewat data produksi: 45hfkSE5DvA-E153
+// dan 45hfkSE5DvA-E167 lolos sebagai finalStatus VALID dengan seluruh
+// hasil PASS meskipun claim-nya sudah berupa dua kalimat digabung.
+export function resolveDuplicateActions(
+  identifiedEvidence: EvidenceItem[],
+  duplicateResult: DuplicateResult,
+  segments: SRTSegment[]
+): DuplicateResolutionOutput {
+  const removedEvidenceIds = new Set<string>();
+  const duplicateRemovedDetails: DuplicateResolutionOutput['duplicateRemovedDetails'] = [];
+
+  const mergedEvidenceToAdd: EvidenceItem[] = [];
+  const duplicateMergedDetails: DuplicateResolutionOutput['duplicateMergedDetails'] = [];
+
+  // ▼ TAMBAHAN LOG
+  console.log(`🔍 Duplicate pairs total: ${duplicateResult.duplicatePairs.length}`);
+  for (const r of duplicateResult.duplicatePairs) {
+    console.log(
+      `   ${r.evidence_id_a} ↔ ${r.evidence_id_b} | action=${r.action} | ` +
+      `hasMergedEvidence=${!!r.mergedEvidence} | keptId=${r.keptId ?? '-'} | reason="${r.reason}"`
+    );
+  }
+  console.log('---');
+
+  for (const resolution of duplicateResult.duplicatePairs) {
+    if (resolution.action === 'PRESERVE') continue;
+
+    if (resolution.action === 'MERGE') {
+      if (!resolution.mergedEvidence) {
+        console.warn(
+          `⚠️ Resolution MERGE tanpa mergedEvidence untuk ` +
+          `${resolution.evidence_id_a}/${resolution.evidence_id_b}, dilewati (PRESERVE fallback).`
+        );
+        continue;
+      }
+
+      // ▼ TAMBAHAN LOG
+      console.log(
+        `🔀 MERGE attempt: ${resolution.evidence_id_a}/${resolution.evidence_id_b}`
+      );
+
+      // Re-validasi merged evidence. resolveIdenticalOccurrenceOrMerge
+      // menjamin source_coordinates evidenceA === evidenceB, jadi span
+      // segmen yang sama bisa dipakai untuk membangun EvidenceContext.
+      const mergedCoords = resolution.mergedEvidence.source_coordinates;
+      let mergedForAcceptance = resolution.mergedEvidence;
+
+      if (mergedCoords) {
+        const mergedContext: EvidenceContext = {
+          chunkIndex: mergedCoords.chunk_index,
+          chunkText: segments
+            .filter(
+              s =>
+                s.index >= mergedCoords.segment_start_index &&
+                s.index <= mergedCoords.segment_end_index
+            )
+            .map(s => s.text)
+            .join(' '),
+          chunkSegments: segments.filter(
+            s =>
+              s.index >= mergedCoords.segment_start_index &&
+              s.index <= mergedCoords.segment_end_index
+          )
+        };
+
+        const mergedReport = EvidenceValidator.validate(
+          resolution.mergedEvidence,
+          mergedContext
+        );
+
+        if (!mergedReport.accepted) {
+          // ▼ TINGKATKAN LOG INI
+          console.warn(
+            `⚠️ Merged evidence ${resolution.evidence_id_a}/${resolution.evidence_id_b} ` +
+            `GAGAL re-validasi setelah digabung (${mergedReport.quarantineReason}). ` +
+            `Batal MERGE, kedua evidence asal di-PRESERVE.`
+          );
+          console.warn(
+            `   Detail: ` +
+            JSON.stringify(
+              mergedReport.results.map(r => ({
+                rule: r.rule,
+                status: r.status,
+                severity: r.severity,
+                reason: r.reason
+              })),
+              null,
+              2
+            )
+          );
+          console.warn(
+            `   Merged claim: "${resolution.mergedEvidence.claim}"`
+          );
+          console.warn(
+            `   Merged subtopic: ${resolution.mergedEvidence.subtopic} | ` +
+            `merged_subtopics: ${JSON.stringify(resolution.mergedEvidence.merged_subtopics)}`
+          );
+          continue;
+        }
+
+        mergedForAcceptance = { ...resolution.mergedEvidence, validation: mergedReport };
+      } else {
+        console.warn(
+          `⚠️ Merged evidence ${resolution.evidence_id_a}/${resolution.evidence_id_b} ` +
+          `tidak punya source_coordinates, tidak bisa re-validasi. Diterima apa adanya ` +
+          `(risiko: validation stale dari evidenceA).`
+        );
+      }
+
+      removedEvidenceIds.add(resolution.evidence_id_a);
+      removedEvidenceIds.add(resolution.evidence_id_b);
+      // mergedEvidenceToAdd.push(resolution.mergedEvidence);
+      mergedEvidenceToAdd.push(mergedForAcceptance);
+
+      duplicateMergedDetails.push({
+        evidence_id_a: resolution.evidence_id_a,
+        evidence_id_b: resolution.evidence_id_b,
+        merged_evidence_id:
+          // resolution.mergedEvidence.evidence_id || resolution.evidence_id_a,
+          mergedForAcceptance.evidence_id || resolution.evidence_id_a,
+        reason: resolution.reason
+      });
+
+      continue;
+    }
+
+    let evidenceIdToRemove: string | null = null;
+    let keptId: string | null = null;
+
+    //if (resolution.action === 'KEEP_BEST') {
+      //const lower = resolution.reason.toLowerCase();
+      //if (lower.includes('a lebih') || lower.includes('a memiliki')) {
+        //keptId = resolution.evidence_id_a;
+        //evidenceIdToRemove = resolution.evidence_id_b;
+      //} else if (lower.includes('b lebih') || lower.includes('b memiliki')) {
+        //keptId = resolution.evidence_id_b;
+        //evidenceIdToRemove = resolution.evidence_id_a;
+      //} else {
+        //keptId = resolution.evidence_id_a;
+        //evidenceIdToRemove = resolution.evidence_id_b;
+      //}
+    //} else if (resolution.action === 'KEEP_FIRST') {
+      //keptId = resolution.evidence_id_a;
+      //evidenceIdToRemove = resolution.evidence_id_b;
+      // Pakai field terstruktur keptId (lihat duplicate.ts), bukan lagi
+    // menebak dari isi `reason`. Kalau suatu saat duplicate.ts lupa
+    // mengisi keptId untuk KEEP_BEST/KEEP_FIRST, ini akan error keras
+    // alih-alih diam-diam salah pilih A.
+    if (resolution.action === 'KEEP_BEST' || resolution.action === 'KEEP_FIRST') {
+      if (!resolution.keptId) {
+        console.warn(
+          `⚠️ Resolution ${resolution.action} tanpa keptId untuk ` +
+          `${resolution.evidence_id_a}/${resolution.evidence_id_b}, dilewati (PRESERVE fallback).`
+        );
+        continue;
+      }
+      keptId = resolution.keptId;
+      evidenceIdToRemove =
+        keptId === resolution.evidence_id_a
+          ? resolution.evidence_id_b
+          : resolution.evidence_id_a;
+    }
+
+        if (evidenceIdToRemove) {
+      removedEvidenceIds.add(evidenceIdToRemove);
+      duplicateRemovedDetails.push({
+        evidence_id: evidenceIdToRemove,
+        reason: resolution.reason,
+        kept_evidence_id: keptId || '',
+      });
+    } else {
+      // Action KEEP_FIRST/KEEP_BEST yang tidak menghasilkan aksi
+      console.log(
+        `ℹ️ Skip: ${resolution.evidence_id_a}/${resolution.evidence_id_b} | ` +
+        `action=${resolution.action} | evidenceIdToRemove=null`
+      );
+    }
+  } 
+
+  const preservedEvidence = identifiedEvidence
+    .filter(ev => !removedEvidenceIds.has(ev.evidence_id || ''))
+    .concat(mergedEvidenceToAdd);
+
+  return { preservedEvidence, duplicateRemovedDetails, duplicateMergedDetails };
+}
+
+// --------------------------------------------------
+// ANALYZE REVIEW (Endpoint utama)
+// --------------------------------------------------
+
+app.post('/api/analyze-review', async (req, res) => {
+  try {
+    const { metadata = {}, srtContent, reviewerName = 'Reviewer' } = req.body;
+
+    if (!srtContent || typeof srtContent !== 'string') {
+      return res.status(400).json({
+        error: 'Konten transcript.srt kosong atau tidak valid.'
+      });
+    }
+
+    const [summary, evidenceResult] = await Promise.all([
+      generateSummary(srtContent, metadata, reviewerName),
+      extractEvidence(srtContent, metadata, reviewerName)
+    ]);
+
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      endpoint: 'analyze-review',
+
+      // Production prompt permanently locked to A.
+      prompt_version: 'A',
+
+      // Extraction funnel.
+      parsed_evidence: evidenceResult.stats.parsedEvidenceCount,
+      structurally_invalid: evidenceResult.stats.structurallyInvalidCount,
+      validator_accepted: evidenceResult.stats.validatorAcceptedCount,
+      quarantine: evidenceResult.stats.quarantineCount,
+
+      // Duplicate funnel.
+      duplicate_removed: evidenceResult.stats.duplicateRemovedCount,
+      duplicate_merged: evidenceResult.stats.duplicateMergedCount,
+      final_evidence: evidenceResult.stats.finalCount,
+
+      // Multi-occurrence telemetry.
+      eligible_multi: evidenceResult.stats.eligibleMultiCount,
+      resolved_multi: evidenceResult.stats.resolvedMultiCount,
+      quarantine_multi: evidenceResult.stats.quarantineMultiCount,
+
+      multi_resolution_rate: evidenceResult.stats.multiResolutionRate,
+      multi_quarantine_rate: evidenceResult.stats.multiQuarantineRate
+    }));
+
+    return res.json({
+      success: true,
+      metadata,
+      summary,
+      evidence: evidenceResult.evidence,
+      quarantine: evidenceResult.quarantine,
+      duplicateRemoved: evidenceResult.duplicateRemoved,
+      duplicateMerged: evidenceResult.duplicateMerged,
+      stats: evidenceResult.stats
+    });
+
+  } catch (error: any) {
+    console.error('❌ Error in analyze-review:', error);
+    return res.status(500).json({
+      error: error?.message || 'Terjadi kesalahan pada server.'
+    });
+  }
+});
+
+// ==========================================
+// ENDPOINT: GENERATE SUMMARY SAJA
+// ==========================================
+app.post('/api/summary', async (req, res) => {
+  try {
+    const { srtContent, metadata = {}, reviewerName = 'Reviewer' } = req.body;
+    if (!srtContent || typeof srtContent !== 'string') {
+      return res.status(400).json({ error: 'srtContent wajib diisi dan berupa string.' });
+    }
+
+    const summary = await generateSummary(srtContent, metadata, reviewerName);
+    res.json({ success: true, summary });
+  } catch (error: any) {
+    console.error('❌ Error di /api/summary:', error);
+    res.status(500).json({ error: error.message || 'Terjadi kesalahan pada server.' });
+  }
+});
+
+// ==========================================
+// ENDPOINT: EXTRACT EVIDENCE SAJA
+// ==========================================
+app.post('/api/evidence', async (req, res) => {
+  try {
+    const { srtContent, metadata = {}, reviewerName = 'Reviewer' } = req.body;
+    if (!srtContent || typeof srtContent !== 'string') {
+      return res.status(400).json({ error: 'srtContent wajib diisi dan berupa string.' });
+    }
+
+    const result = await extractEvidence(
+      srtContent,
+      metadata,
+      reviewerName
+    );
+
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      endpoint: 'evidence',
+      prompt_version: 'A',
+
+      parsed_evidence: result.stats.parsedEvidenceCount,
+      structurally_invalid: result.stats.structurallyInvalidCount,
+      validator_accepted: result.stats.validatorAcceptedCount,
+      quarantine: result.stats.quarantineCount,
+
+      duplicate_removed: result.stats.duplicateRemovedCount,
+      duplicate_merged: result.stats.duplicateMergedCount,
+      final_evidence: result.stats.finalCount,
+
+      eligible_multi: result.stats.eligibleMultiCount,
+      resolved_multi: result.stats.resolvedMultiCount,
+      quarantine_multi: result.stats.quarantineMultiCount,
+
+      multi_resolution_rate: result.stats.multiResolutionRate,
+      multi_quarantine_rate: result.stats.multiQuarantineRate
+    }));
+
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    console.error('❌ Error di /api/evidence:', error);
+    res.status(500).json({ error: error.message || 'Terjadi kesalahan pada server.' });
+  }
+});
+
+// ==========================================
+// 6. START SERVER
+// ==========================================
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
+  }
+  app.listen(PORT, '0.0.0.0', () => console.log(`Server running on http://0.0.0.0:${PORT}`));
+}
+
+if (!process.env.VITEST) {
+  startServer();
+}

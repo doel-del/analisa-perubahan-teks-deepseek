@@ -1,0 +1,32 @@
+[
+  {
+    "id": "grammar",
+    "name": "✨ Tata Bahasa & Ejaan",
+    "instruction": "Perbaiki tata bahasa, ejaan (EBI/PUEBI), typo, penulisan kata, kapitalisasi, dan tanda baca dari teks berikut agar benar dan rapi."
+  },
+  {
+    "id": "formal",
+    "name": "💼 Bahasa Formal & Profesional",
+    "instruction": "Ubah dan sesuaikan teks berikut menjadi berlaras bahasa formal, profesional, baku, dan sopan, dengan memperbaiki semua ejaan dan tata bahasa."
+  },
+  {
+    "id": "concise",
+    "name": "⚡ Ringkas & Padat",
+    "instruction": "Perbaiki dan ringkas teks berikut agar lebih efektif, padat, dan tidak bertele-tele tanpa menghilangkan gagasan utama."
+  },
+  {
+    "id": "expand",
+    "name": "📝 Perjelas & Elaborasi",
+    "instruction": "Perbaiki dan perjelas teks berikut dengan kalimat yang lebih runtut, lengkap, dan informatif."
+  },
+  {
+    "id": "stt_lucid",
+    "name": "🔧 STT Lucid LD60 (Ahli Teknisi)",
+    "instruction": "Anda adalah seorang Ahli Linguistik dan Teknisi Alat Pertukangan (Power Tools/Woodworking) yang bertugas mengoreksi transkrip YouTube berbahasa Indonesia dari hasil sistem Speech-to-Text (STT) otomatis.\n\nTUGAS:\nBersihkan transkrip STT mentah dari kesalahan baca, salah dengar (fonetik), typo, dan pengulangan kata (stutter), lalu berikan paragraph agar terbaca, tanpa mengorbankan hubungan kalimat.\n\nATURAN KETAT (PENTING):\n1. PERTAHANKAN GAYA BAHASA KASUAL: Jangan membakukan bahasa pembicara. Biarkan kata seperti \"nyekrup\", \"cuy\", \"enggak\", \"beneran\", \"gede\". JANGAN ubah menjadi \"menyekrup\", \"saudara\", \"tidak\", dll.\n2. JANGAN MENGHAPUS MAKNA/KALIMAT: Perbaiki ejaan yang salah dengar, jangan membuang kalimat atau menebak-nebak konteks di luar alat teknik.\n3. BERSIHKAN STUTTER: Hapus pengulangan kata akibat gagap STT (contoh: \"karena memang karena kalau\" menjadi \"karena kalau\") dan filler (ee, ah)."
+  },
+  {
+  "id": "srt_grammar",
+  "name": "✨ SRT: Tata Bahasa & Ejaan",
+  "instruction": "Perbaiki tata bahasa, ejaan (EBI/PUEBI), typo, kapitalisasi, dan tanda baca di dalam setiap segmen SRT berikut. JANGAN ubah nomor urut, timestamp, jumlah segmen, atau urutan segmen. JANGAN gabung, pecah, hapus, atau tambah segmen. JANGAN mengisi segmen kosong. JANGAN menambahkan teks non-dialog. Output hanya SRT."
+  }
+]

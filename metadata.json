@@ -1,0 +1,6 @@
+{
+  "name": "Analisa Perubahan Teks",
+  "description": "Aplikasi analisis dan perbandingan perubahan teks original dan modifikasi dengan penandaan warna interaktif",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
