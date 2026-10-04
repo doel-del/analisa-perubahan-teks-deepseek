@@ -16,6 +16,7 @@ import {
   buildMetadataContext,
   getReviewerName,
   buildEvidenceInstruction,
+  normalizeNullishFields,
   PRODUCTION_SYSTEM_INSTRUCTION_EVIDENCE,
   type ReviewMetadata
 } from './src/evidence/production-pipeline';
@@ -241,6 +242,10 @@ interface ChunkRunRecord {
   model: string | null;
   // PARSE_FAILED: LLM menjawab tetapi JSON gagal diparse -> chunk TIDAK menghasilkan evidence.
   status: 'OK' | 'EMPTY' | 'FAILED' | 'PARSE_FAILED';
+  // Jumlah field berisi string kosong/"null" yang dinormalisasi ke null.
+  nullish_normalized?: number;
+  // Terisi bila JSON rusak dan parser memakai penyelamatan per objek.
+  salvage?: { recovered: number; repaired: number; skipped: number; truncated: boolean };
   error?: string;
   raw_chars: number | null;      // panjang output mentah LLM (deteksi pemotongan)
   parse_status: string | null;
@@ -502,6 +507,14 @@ async function extractEvidence(
       rec.parse_status = String(parsedResult.status);
       rec.parse_strategy = String(parsedResult.strategy);
       rec.parsed = chunkEvidence.length;
+      if (parsedResult.strategy === 'object_salvage' && parsedResult.salvage) {
+        const sv = parsedResult.salvage;
+        rec.salvage = sv;
+        console.warn(
+          `⚠️ Chunk ke-${batchNumber}: JSON rusak, ${sv.recovered} item diselamatkan ` +
+          `(${sv.repaired} diperbaiki, ${sv.skipped} dilewati${sv.truncated ? ', output terpotong' : ''}).`
+        );
+      }
       if (parsedResult.status === 'FAILED') {
         rec.status = 'PARSE_FAILED';
         console.warn(
@@ -547,12 +560,16 @@ async function extractEvidence(
         continue;
       }
 
+      let nullishFixed = 0;
       for (const ev of structurallyValidEvidence) {
         const context: EvidenceContext = {
           chunkIndex,
           chunkText,
           chunkSegments: chunk
         };
+
+        // ▼ Normalisasi string kosong/"null" -> null (sebelum reconcile & validasi)
+        nullishFixed += normalizeNullishFields(ev);
 
         // ▼ Auto-reconcile sebelum validasi
         const reconciledEv = reconcileTypeWithAssessment(ev);
@@ -614,6 +631,14 @@ async function extractEvidence(
           if (isMulti) quarantineMultiCount++;
         }
       }  // ← INI YANG HILANG: tutup loop for (const ev of validEvidence)
+
+      if (nullishFixed > 0) {
+        rec.nullish_normalized = nullishFixed;
+        console.warn(
+          `⚠️ Chunk ke-${batchNumber}: ${nullishFixed} field berisi string kosong/"null" ` +
+          `dinormalisasi ke null (format keluaran model menyimpang dari skema).`
+        );
+      }
 
       rec.status = 'OK';
       rec.accepted = allEvidence.length - accStart;
