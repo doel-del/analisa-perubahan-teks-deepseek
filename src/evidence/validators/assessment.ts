@@ -9,11 +9,27 @@ import type { ValidationResult } from '../types';
 
 const ALLOWED_TYPES_FOR_ASSESSMENT = ['OPINION'];
 
+// Keputusan kebijakan (audit 8 run, 3 video): 'agak' DIHAPUS dari leksikon.
+// 'agak' adalah kata penguat deskriptif ("agak lama", "agak hitam",
+// "agak berbeda"), bukan penilaian. Sebagai satu-satunya pemicu, ia
+// mengkarantina klaim non-evaluatif di setiap run. Penilaian sungguhan
+// ("agak jelek") tetap tertangkap lewat kata evaluatif lain ('jelek').
 const EVALUATIVE_WORDS = [
   'cukup', 'cukup jelas', 'cukup bagus', 'cukup luas', 'cukup stabil',
   'mantap', 'bagus', 'cakep', 'jelek', 'kurang', 'buruk', 'cakep banget',
-  'tergolong', 'terbilang', 'memadai', 'minim', 'agak', 'jauh lebih', 'luar biasa'
+  'tergolong', 'terbilang', 'memadai', 'minim', 'jauh lebih', 'luar biasa'
 ];
+
+// Idiom yang mengandung kata leksikon tetapi BUKAN penilaian. Dinetralkan
+// sebelum pencocokan. "kurang lebih" = "kira-kira"; tanpa ini kata 'kurang'
+// memicu pada setiap perbandingan "kurang lebih mirip".
+const NEUTRAL_IDIOMS: RegExp[] = [
+  /\bkurang\s+lebih\b/gi
+];
+
+function neutralizeIdioms(text: string): string {
+  return NEUTRAL_IDIOMS.reduce((t, re) => t.replace(re, ' '), text);
+}
 
 // N6: Whitelist frasa teknis. Frasa ini mengandung kata evaluatif
 // (minim, tergolong, agak) tetapi dalam konteks teknis/terukur.
@@ -37,7 +53,8 @@ const TECHNICAL_WHITELIST_PHRASES = [
 
 // N6: Word-boundary matching untuk menghindari false positive substring.
 // Contoh: "kurang" di dalam "berkurang" bukan kata evaluatif.
-export function findEvaluativeWords(text: string): string[] {
+export function findEvaluativeWords(rawText: string): string[] {
+  const text = neutralizeIdioms(rawText);
   return EVALUATIVE_WORDS.filter(w => {
     const escaped = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const regex = new RegExp(`(^|[^a-z])${escaped}([^a-z]|$)`, 'i');
