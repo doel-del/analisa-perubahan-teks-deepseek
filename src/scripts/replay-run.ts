@@ -20,6 +20,7 @@
 // Di luar : duplicate gate, pemetaan relasi, pemanggilan LLM.
 // Chunk yang gagal diparse otomatis didiagnosis (terpotong / sintaks rusak / teks tambahan).
 //
+// Mirror server.ts: normalizeNullishFields -> reconcile -> validate.
 // CATATAN DRIFT: isValidEvidence dan reconcileTypeWithAssessment di bawah
 // adalah SALINAN dari server.ts. Kolom "parity" membandingkan hasil replay
 // dengan angka asli di runs.jsonl. BEDA itu wajar bila validator sengaja
@@ -34,7 +35,8 @@ import {
   parseSRT,
   buildEvidenceChunks,
   buildChunkText,
-  parseEvidenceJSONDetailed
+  parseEvidenceJSONDetailed,
+  normalizeNullishFields
 } from '../src/evidence/production-pipeline';
 import { EvidenceValidator } from '../src/evidence/validators/evidence-validator';
 import type { EvidenceContext, EvidenceItem } from '../src/evidence/types';
@@ -285,6 +287,7 @@ function replayRun(run: RunRecord): ReplayResult {
     let accepted = 0;
     let quarantine = 0;
     for (const ev of valid) {
+      normalizeNullishFields(ev); // mirror server.ts: string kosong/"null" -> null
       const reconciled = reconcileTypeWithAssessment(ev);
       const report = EvidenceValidator.validate(reconciled, context);
       const blocking = report.results
@@ -313,6 +316,9 @@ function replayRun(run: RunRecord): ReplayResult {
       quarantine,
       parseStatus: parsedResult.status,
       strategy: String(parsedResult.strategy),
+      note: (parsedResult as any).salvage
+        ? `diselamatkan ${(parsedResult as any).salvage.recovered} item (diperbaiki ${(parsedResult as any).salvage.repaired}, dilewati ${(parsedResult as any).salvage.skipped}${(parsedResult as any).salvage.truncated ? ', terpotong' : ''})`
+        : undefined,
       diagnosis: parsedResult.status === 'FAILED' ? diagnoseParseFailure(rawText) : undefined
     });
   });
