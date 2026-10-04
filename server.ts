@@ -2,6 +2,8 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import fs from 'fs';
+import crypto from 'crypto';
+import { execSync } from 'child_process';
 import dotenv from 'dotenv';
 
 // Pasca E3.D
@@ -163,6 +165,167 @@ async function generateSummary(
 }
 
 // ==========================================
+// RUN FINGERPRINT & RUN LOG
+// ==========================================
+// Tujuan: setiap run bisa dibandingkan dengan run lain. Yang dicatat:
+//   - identitas kode (git commit + dirty + hash isi file kunci),
+//   - hash prompt evidence & system instruction,
+//   - tabel per chunk (parsed / accepted / quarantine / status / panjang output),
+//   - output mentah LLM per chunk (untuk replay validator tanpa API).
+// Nonaktifkan dengan EVIDENCE_RUN_LOG=0. Lokasi: EVIDENCE_RUN_LOG_DIR (default ./runs).
+// Tambahkan "runs/" ke .gitignore.
+// ==========================================
+
+const RUN_LOG_ENABLED = process.env.EVIDENCE_RUN_LOG !== '0';
+const RUN_LOG_DIR = path.resolve(process.env.EVIDENCE_RUN_LOG_DIR ?? './runs');
+
+function shortHash(input: string | Buffer): string {
+  return crypto.createHash('sha256').update(input).digest('hex').slice(0, 8);
+}
+
+// Hash isi file kode kunci: tetap membedakan versi kode walau working tree
+// belum di-commit (commit hash saja tidak cukup saat banyak perubahan lokal).
+function computeCodeHash(): string {
+  const files: string[] = [
+    'server.ts',
+    'prompts.ts',
+    'src/llm/llm-provider.ts',
+    'src/evidence/production-pipeline.ts',
+    'src/evidence/related-ids.ts',
+    'src/evidence/search.ts',
+    'src/evidence/srt.ts',
+    'src/evidence/text-matching.ts'
+  ];
+  try {
+    const vdir = 'src/evidence/validators';
+    for (const f of fs.readdirSync(vdir).sort()) {
+      if (f.endsWith('.ts')) files.push(`${vdir}/${f}`);
+    }
+  } catch { /* abaikan */ }
+
+  const h = crypto.createHash('sha256');
+  for (const f of files) {
+    try {
+      h.update(f);
+      h.update(fs.readFileSync(f));
+    } catch { /* file tidak ada: lewati */ }
+  }
+  return h.digest('hex').slice(0, 8);
+}
+
+// git_dirty hanya menghitung file TERLACAK yang berubah (runs/ dan file lepas
+// tidak membuatnya selalu true); isi file kunci sudah tercakup code_hash.
+function readGitInfo(): { git_commit: string; git_dirty: boolean | null } {
+  try {
+    const opts = { stdio: ['ignore', 'pipe', 'ignore'] as ['ignore', 'pipe', 'ignore'] };
+    const commit = execSync('git rev-parse --short HEAD', opts).toString().trim();
+    const dirty = execSync('git status --porcelain --untracked-files=no', opts).toString().trim().length > 0;
+    return { git_commit: commit, git_dirty: dirty };
+  } catch {
+    return { git_commit: 'unknown', git_dirty: null };
+  }
+}
+
+// Dihitung sekali saat server start.
+const RUN_FINGERPRINT = {
+  ...readGitInfo(),
+  code_hash: computeCodeHash(),
+  prompt_hash: shortHash(ANALYSIS_PROMPT_EVIDENCE_A),
+  system_hash: shortHash(PRODUCTION_SYSTEM_INSTRUCTION_EVIDENCE)
+};
+
+interface ChunkRunRecord {
+  chunk: number;                 // 1-based
+  segments: [number, number];    // indeks segmen pertama..terakhir
+  chars: number;                 // panjang input chunk
+  model: string | null;
+  // PARSE_FAILED: LLM menjawab tetapi JSON gagal diparse -> chunk TIDAK menghasilkan evidence.
+  status: 'OK' | 'EMPTY' | 'FAILED' | 'PARSE_FAILED';
+  error?: string;
+  raw_chars: number | null;      // panjang output mentah LLM (deteksi pemotongan)
+  parse_status: string | null;
+  parse_strategy: string | null;
+  parsed: number;
+  accepted: number;
+  quarantine: number;
+}
+
+interface RunInfo {
+  run_id: string;
+  review_id: string | null;
+  srt_sha: string;
+  chunk_chars: number;
+  chunk_overlap: number;
+  chunks: ChunkRunRecord[];
+}
+
+function saveRunArtifact(dir: string | null, name: string, content: string): void {
+  if (!dir) return;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, name), content, 'utf8');
+  } catch (err) {
+    console.warn(`⚠️ Gagal menyimpan ${name}:`, (err as Error)?.message);
+  }
+}
+
+// Satu baris ringkas ke konsol (seperti sebelumnya + identitas run) dan
+// satu baris lengkap (dengan tabel per chunk) ke runs/runs.jsonl.
+function logRunLine(
+  endpoint: string,
+  stats: Awaited<ReturnType<typeof extractEvidence>>['stats'],
+  runInfo: RunInfo
+): void {
+  const core = {
+    ts: new Date().toISOString(),
+    endpoint,
+    prompt_version: 'A',
+
+    // Extraction funnel.
+    parsed_evidence: stats.parsedEvidenceCount,
+    structurally_invalid: stats.structurallyInvalidCount,
+    validator_accepted: stats.validatorAcceptedCount,
+    quarantine: stats.quarantineCount,
+
+    // Duplicate funnel.
+    duplicate_removed: stats.duplicateRemovedCount,
+    duplicate_merged: stats.duplicateMergedCount,
+    final_evidence: stats.finalCount,
+
+    // Multi-occurrence telemetry.
+    eligible_multi: stats.eligibleMultiCount,
+    resolved_multi: stats.resolvedMultiCount,
+    quarantine_multi: stats.quarantineMultiCount,
+    multi_resolution_rate: stats.multiResolutionRate,
+    multi_quarantine_rate: stats.multiQuarantineRate
+  };
+
+  const failedChunks = runInfo.chunks
+    .filter(c => c.status === 'FAILED' || c.status === 'PARSE_FAILED')
+    .map(c => c.chunk);
+  console.log(JSON.stringify({
+    ...core,
+    run_id: runInfo.run_id,
+    git_commit: RUN_FINGERPRINT.git_commit,
+    git_dirty: RUN_FINGERPRINT.git_dirty,
+    code_hash: RUN_FINGERPRINT.code_hash,
+    failed_chunks: failedChunks
+  }));
+
+  if (!RUN_LOG_ENABLED) return;
+  try {
+    fs.mkdirSync(RUN_LOG_DIR, { recursive: true });
+    fs.appendFileSync(
+      path.join(RUN_LOG_DIR, 'runs.jsonl'),
+      JSON.stringify({ ...core, ...RUN_FINGERPRINT, ...runInfo }) + '\n',
+      'utf8'
+    );
+  } catch (err) {
+    console.warn('⚠️ Gagal menulis runs.jsonl:', (err as Error)?.message);
+  }
+}
+
+// ==========================================
 // FUNGSI EXTRACT EVIDENCE (TERPISAH)
 // ==========================================
 
@@ -190,6 +353,7 @@ async function extractEvidence(
     multiQuarantineRate: number | null;
     promptVersion: 'A';
   };
+  runInfo: RunInfo;
 }> {
   // Parse SRT
   const segments = parseSRT(srtContent);
@@ -207,6 +371,24 @@ async function extractEvidence(
     Number(process.env.EVIDENCE_CHUNK_OVERLAP ?? 3)
   );
   console.log(`📦 Evidence extraction akan menggunakan ${evidenceChunks.length} chunk.`);
+
+  // Identitas run + tabel per chunk (lihat RUN FINGERPRINT & RUN LOG).
+  const srtSha = shortHash(srtContent);
+  const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}_${metadata.id ?? 'noid'}`;
+  const runDir = RUN_LOG_ENABLED ? path.join(RUN_LOG_DIR, runId) : null;
+  const chunkRecords: ChunkRunRecord[] = [];
+  if (RUN_LOG_ENABLED) {
+    // SRT disimpan sekali per isi (dedup lewat hash) untuk replay.
+    const srtPath = path.join(RUN_LOG_DIR, '_srt', `${srtSha}.srt`);
+    try {
+      if (!fs.existsSync(srtPath)) {
+        fs.mkdirSync(path.dirname(srtPath), { recursive: true });
+        fs.writeFileSync(srtPath, srtContent, 'utf8');
+      }
+    } catch (err) {
+      console.warn('⚠️ Gagal menyimpan SRT run:', (err as Error)?.message);
+    }
+  }
 
 
   let allEvidence: EvidenceItem[] = [];
@@ -277,6 +459,23 @@ async function extractEvidence(
     const charLength = chunkText.length;
     console.log(`📏 Chunk ${batchNumber} - Karakter: ${charLength}, Estimasi Token: ~${Math.ceil(charLength / 4)}`);
 
+    const rec: ChunkRunRecord = {
+      chunk: batchNumber,
+      segments: [firstSegment.index, lastSegment.index],
+      chars: charLength,
+      model: null,
+      status: 'FAILED',
+      raw_chars: null,
+      parse_status: null,
+      parse_strategy: null,
+      parsed: 0,
+      accepted: 0,
+      quarantine: 0
+    };
+    chunkRecords.push(rec);
+    const accStart = allEvidence.length;
+    const quarStart = quarantinedEvidence.length;
+
     try {
       const result = await callLLMWithFallback(
         chunkText,
@@ -290,6 +489,9 @@ async function extractEvidence(
       }
 
       const rawOutput = result.content;
+      rec.model = result.model ?? null;
+      rec.raw_chars = rawOutput.length;
+      saveRunArtifact(runDir, `chunk-${batchNumber}.raw.txt`, rawOutput);
       // const chunkEvidence = parseEvidenceJSON(rawOutput);
       // Pakai versi detailed agar strategi fallback yang berhasil bisa
       // dilog. Perilaku parsing IDENTIK dengan parseEvidenceJSON --
@@ -297,6 +499,16 @@ async function extractEvidence(
       // production-pipeline.ts) -- ini murni menambah observability.
       const parsedResult = parseEvidenceJSONDetailed(rawOutput);
       const chunkEvidence = parsedResult.evidence as EvidenceItem[];
+      rec.parse_status = String(parsedResult.status);
+      rec.parse_strategy = String(parsedResult.strategy);
+      rec.parsed = chunkEvidence.length;
+      if (parsedResult.status === 'FAILED') {
+        rec.status = 'PARSE_FAILED';
+        console.warn(
+          `⚠️ Chunk ke-${batchNumber}: parse JSON GAGAL (output mentah ${rawOutput.length} karakter) -- ` +
+          `chunk ini TIDAK menghasilkan evidence. Diagnosis: npx tsx scripts/replay-run.ts <run_id>`
+        );
+      }
 
       // Nomor lokal LLM dihitung dari SEMUA item hasil parse, sebelum filter
       // struktural/validator, karena LLM menomori urutan keluarannya sendiri.
@@ -307,7 +519,9 @@ async function extractEvidence(
         `   🔢 Chunk ${chunkIndex + 1}: ${chunkKeyDiag.totalParsed} item parse, nomor lokal ` +
         `${chunkKeyDiag.idRange ? chunkKeyDiag.idRange.join('..') : '-'} [${chunkKeyDiag.mode}/${chunkKeyDiag.reason}]`
       );
-      if (chunkKeyDiag.mode === 'position') {
+      // empty-chunk (0 item parse): tidak ada yang dinomori, jadi bukan masalah
+      // penomoran. Peringatan PARSE_FAILED/EMPTY di bawah sudah menandai chunk-nya.
+      if (chunkKeyDiag.mode === 'position' && chunkKeyDiag.reason !== 'empty-chunk') {
         console.warn(
           `⚠️ Chunk ${chunkIndex + 1}: nomor lokal memakai posisi (alasan: ${chunkKeyDiag.reason}, ` +
           `id hilang: ${chunkKeyDiag.missingIds}, id ganda: ${chunkKeyDiag.duplicateIds.join(',') || '-'})`
@@ -329,6 +543,7 @@ async function extractEvidence(
 
       if (structurallyValidEvidence.length === 0) {
         console.log(`⚠️ Chunk ke-${batchNumber} tidak menghasilkan evidence valid.`);
+        if (rec.status !== 'PARSE_FAILED') rec.status = 'EMPTY';
         continue;
       }
 
@@ -400,9 +615,16 @@ async function extractEvidence(
         }
       }  // ← INI YANG HILANG: tutup loop for (const ev of validEvidence)
 
+      rec.status = 'OK';
+      rec.accepted = allEvidence.length - accStart;
+      rec.quarantine = quarantinedEvidence.length - quarStart;
       console.log(`✅ Chunk ke-${batchNumber} selesai. Total valid: ${allEvidence.length}, Quarantine: ${quarantinedEvidence.length}`);
     } catch (err) {
       console.error(`❌ Gagal memproses Chunk ke-${batchNumber}:`, err);
+      rec.status = 'FAILED';
+      rec.error = String((err as any)?.message ?? err).slice(0, 200);
+      rec.accepted = allEvidence.length - accStart;
+      rec.quarantine = quarantinedEvidence.length - quarStart;
       continue;
     }
 
@@ -512,6 +734,15 @@ async function extractEvidence(
   const duplicateRemovedCount = duplicateRemovedDetails.length;
   const mergedCount = duplicateMergedDetails.length;
 
+  const runInfo: RunInfo = {
+    run_id: runId,
+    review_id: metadata.id ?? null,
+    srt_sha: srtSha,
+    chunk_chars: Number(process.env.EVIDENCE_CHUNK_CHARS ?? 18000),
+    chunk_overlap: Number(process.env.EVIDENCE_CHUNK_OVERLAP ?? 3),
+    chunks: chunkRecords
+  };
+
   return {
     evidence: finalEvidence,
     quarantine: quarantinedEvidence,
@@ -554,7 +785,8 @@ async function extractEvidence(
       // PRODUCTION PROMPT
       // ==========================================
       promptVersion: 'A' as const
-    }
+    },
+    runInfo
   };
 }
 
@@ -993,32 +1225,7 @@ app.post('/api/analyze-review', async (req, res) => {
       extractEvidence(srtContent, metadata, reviewerName)
     ]);
 
-    console.log(JSON.stringify({
-      ts: new Date().toISOString(),
-      endpoint: 'analyze-review',
-
-      // Production prompt permanently locked to A.
-      prompt_version: 'A',
-
-      // Extraction funnel.
-      parsed_evidence: evidenceResult.stats.parsedEvidenceCount,
-      structurally_invalid: evidenceResult.stats.structurallyInvalidCount,
-      validator_accepted: evidenceResult.stats.validatorAcceptedCount,
-      quarantine: evidenceResult.stats.quarantineCount,
-
-      // Duplicate funnel.
-      duplicate_removed: evidenceResult.stats.duplicateRemovedCount,
-      duplicate_merged: evidenceResult.stats.duplicateMergedCount,
-      final_evidence: evidenceResult.stats.finalCount,
-
-      // Multi-occurrence telemetry.
-      eligible_multi: evidenceResult.stats.eligibleMultiCount,
-      resolved_multi: evidenceResult.stats.resolvedMultiCount,
-      quarantine_multi: evidenceResult.stats.quarantineMultiCount,
-
-      multi_resolution_rate: evidenceResult.stats.multiResolutionRate,
-      multi_quarantine_rate: evidenceResult.stats.multiQuarantineRate
-    }));
+    logRunLine('analyze-review', evidenceResult.stats, evidenceResult.runInfo);
 
     return res.json({
       success: true,
@@ -1073,27 +1280,7 @@ app.post('/api/evidence', async (req, res) => {
       reviewerName
     );
 
-    console.log(JSON.stringify({
-      ts: new Date().toISOString(),
-      endpoint: 'evidence',
-      prompt_version: 'A',
-
-      parsed_evidence: result.stats.parsedEvidenceCount,
-      structurally_invalid: result.stats.structurallyInvalidCount,
-      validator_accepted: result.stats.validatorAcceptedCount,
-      quarantine: result.stats.quarantineCount,
-
-      duplicate_removed: result.stats.duplicateRemovedCount,
-      duplicate_merged: result.stats.duplicateMergedCount,
-      final_evidence: result.stats.finalCount,
-
-      eligible_multi: result.stats.eligibleMultiCount,
-      resolved_multi: result.stats.resolvedMultiCount,
-      quarantine_multi: result.stats.quarantineMultiCount,
-
-      multi_resolution_rate: result.stats.multiResolutionRate,
-      multi_quarantine_rate: result.stats.multiQuarantineRate
-    }));
+    logRunLine('evidence', result.stats, result.runInfo);
 
     res.json({ success: true, ...result });
   } catch (error: any) {
@@ -1107,7 +1294,18 @@ app.post('/api/evidence', async (req, res) => {
 // ==========================================
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        // runs/ ditulis server saat ekstraksi (runs.jsonl, chunk-N.raw.txt, SRT).
+        // Tanpa ini watcher Vite menganggapnya perubahan source dan me-reload
+        // halaman, sehingga hasil di UI (dan tombol download) hilang.
+        watch: {
+          ignored: ['**/runs/**', `${RUN_LOG_DIR.replace(/\\/g, '/')}/**`]
+        }
+      },
+      appType: 'spa'
+    });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
