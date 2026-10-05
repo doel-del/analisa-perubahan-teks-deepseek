@@ -10,15 +10,29 @@
 //   npx tsx scripts/replay-run.ts                        run terakhir
 //   npx tsx scripts/replay-run.ts <run_id | prefix>      satu run
 //   npx tsx scripts/replay-run.ts --all                  semua run yang punya raw
-//   npx tsx scripts/replay-run.ts <run> --json out.json  simpan keputusan per item
-//   npx tsx scripts/replay-run.ts <run> --diff out.json  bandingkan dengan simpanan
-//   Tambah --full untuk menampilkan SEMUA item quarantine (default 40 pertama).
+//   npx tsx scripts/replay-run.ts <run|--all> --json out.json   simpan keputusan per item
+//   npx tsx scripts/replay-run.ts <run|--all> --diff out.json   bandingkan dengan simpanan
+//   Tambah --full untuk menampilkan SEMUA item (default 40 pertama).
+//
+// ALUR SEBELUM/SESUDAH (perbandingan apple-to-apple untuk perubahan ATURAN):
+//   1. Dengan kode LAMA:   --all --json before.json
+//   2. Terapkan perubahan aturan.
+//   3. Dengan kode BARU:   --all --diff before.json
+//   Input kedua replay adalah file raw yang sama; laporan --diff memverifikasi
+//   itu lewat raw_sha dan menolak menyebutnya apple-to-apple jika berbeda.
+//   Perubahan PROMPT/model tidak bisa diuji dengan replay (butuh run baru).
 //
 // Cakupan : parse JSON -> filter struktural -> auto-reconcile tipe ->
 //           EvidenceValidator.validate (grounding, provenance, assessment,
 //           value, atomicity).
 // Di luar : duplicate gate, pemetaan relasi, pemanggilan LLM.
 // Chunk yang gagal diparse otomatis didiagnosis (terpotong / sintaks rusak / teks tambahan).
+//
+// Tiga hasil per item:
+//   diterima        : lolos semua aturan
+//   diterima+flag   : lolos, tetapi ada aturan non-PASS yang tidak memblokir
+//                     (mis. ASSESSMENT SUSPECT LOW)
+//   karantina       : FAIL atau SUSPECT HIGH
 //
 // Mirror server.ts: normalizeNullishFields -> reconcile -> validate.
 // CATATAN DRIFT: isValidEvidence dan reconcileTypeWithAssessment di bawah
@@ -39,7 +53,13 @@ import {
   normalizeNullishFields
 } from '../src/evidence/production-pipeline';
 import { EvidenceValidator } from '../src/evidence/validators/evidence-validator';
+// Namespace import: tetap jalan pada assessment.ts lama yang belum punya
+// ASSESSMENT_RULES_VERSION (dilaporkan sebagai "legacy").
+import * as assessmentModule from '../src/evidence/validators/assessment';
 import type { EvidenceContext, EvidenceItem } from '../src/evidence/types';
+
+const RULES_VERSION: string =
+  (assessmentModule as unknown as { ASSESSMENT_RULES_VERSION?: string }).ASSESSMENT_RULES_VERSION ?? 'legacy';
 
 // ------------------------------------------------------------
 // Tipe
@@ -67,6 +87,8 @@ interface RunRecord {
   chunks: ChunkRecord[];
 }
 
+type Outcome = 'diterima' | 'diterima+flag' | 'karantina';
+
 interface ItemDecision {
   key: string;            // "<chunk 1-based>:<posisi 1-based pada hasil parse>"
   chunk: number;
@@ -76,6 +98,7 @@ interface ItemDecision {
   claim: string;
   excerpt: string;
   blocking: string[];     // aturan yang menyebabkan quarantine
+  flags: string[];        // aturan non-PASS yang TIDAK memblokir (item diterima)
   reason: string;
 }
 
@@ -84,6 +107,7 @@ interface ChunkReplay {
   parsed: number;
   structurallyInvalid: number;
   accepted: number;
+  flagged: number;
   quarantine: number;
   parseStatus: string;
   strategy: string;
@@ -96,6 +120,20 @@ interface ReplayResult {
   chunks: ChunkReplay[];
   items: ItemDecision[];
   notes: string[];
+  rawSha: string;         // hash seluruh file raw yang dipakai (bukti input identik)
+}
+
+interface SavedRun {
+  run_id?: string;
+  code_hash?: string;
+  rules_version?: string;
+  raw_sha?: string;
+  items: ItemDecision[];
+}
+
+function outcomeOf(i: { accepted: boolean; flags?: string[] }): Outcome {
+  if (!i.accepted) return 'karantina';
+  return (i.flags?.length ?? 0) > 0 ? 'diterima+flag' : 'diterima';
 }
 
 // ------------------------------------------------------------
@@ -240,11 +278,12 @@ function replayRun(run: RunRecord): ReplayResult {
   const notes: string[] = [];
   const chunks: ChunkReplay[] = [];
   const items: ItemDecision[] = [];
+  const rawHash = crypto.createHash('sha256');
 
   const srtPath = path.join(RUN_LOG_DIR, '_srt', `${run.srt_sha}.srt`);
   if (!fs.existsSync(srtPath)) {
     notes.push(`SRT tidak ditemukan: ${srtPath}`);
-    return { run, chunks, items, notes };
+    return { run, chunks, items, notes, rawSha: '-' };
   }
 
   const segments = parseSRT(fs.readFileSync(srtPath, 'utf8'));
@@ -260,18 +299,22 @@ function replayRun(run: RunRecord): ReplayResult {
     );
   }
 
+  let acceptLogicMismatch = 0;
+
   evChunks.forEach((chunk, chunkIndex) => {
     const n = chunkIndex + 1;
     const rawPath = path.join(RUN_LOG_DIR, run.run_id, `chunk-${n}.raw.txt`);
     if (!fs.existsSync(rawPath)) {
       chunks.push({
-        chunk: n, parsed: 0, structurallyInvalid: 0, accepted: 0, quarantine: 0,
+        chunk: n, parsed: 0, structurallyInvalid: 0, accepted: 0, flagged: 0, quarantine: 0,
         parseStatus: '-', strategy: '-', note: 'raw tidak ada (chunk gagal di run asli?)'
       });
       return;
     }
 
     const rawText = fs.readFileSync(rawPath, 'utf8');
+    rawHash.update(`chunk-${n}:`);
+    rawHash.update(rawText);
     const parsedResult = parseEvidenceJSONDetailed(rawText);
     const parsedItems = parsedResult.evidence as EvidenceItem[];
     const positionOf = new Map<unknown, number>();
@@ -285,16 +328,22 @@ function replayRun(run: RunRecord): ReplayResult {
     };
 
     let accepted = 0;
+    let flagged = 0;
     let quarantine = 0;
     for (const ev of valid) {
       normalizeNullishFields(ev); // mirror server.ts: string kosong/"null" -> null
       const reconciled = reconcileTypeWithAssessment(ev);
       const report = EvidenceValidator.validate(reconciled, context);
-      const blocking = report.results
-        .filter(r => r.status === 'FAIL' || (r.status === 'SUSPECT' && r.severity === 'HIGH'))
-        .map(r => r.rule);
+      const isBlocking = (r: { status: string; severity?: string }) =>
+        r.status === 'FAIL' || (r.status === 'SUSPECT' && r.severity === 'HIGH');
+      const blocking = report.results.filter(isBlocking).map(r => r.rule);
+      const flags = report.accepted
+        ? Array.from(new Set(report.results.filter(r => r.status !== 'PASS' && !isBlocking(r)).map(r => r.rule)))
+        : [];
+      // evidence-validator memblokir sesuatu yang menurut aturan blocking di sini lolos?
+      if (!report.accepted && blocking.length === 0) acceptLogicMismatch++;
       const pos = positionOf.get(ev) ?? 0;
-      if (report.accepted) accepted++; else quarantine++;
+      if (report.accepted) { accepted++; if (flags.length) flagged++; } else quarantine++;
       items.push({
         key: `${n}:${pos}`,
         chunk: n,
@@ -304,6 +353,7 @@ function replayRun(run: RunRecord): ReplayResult {
         claim: String(ev.claim ?? ''),
         excerpt: String(ev.source_excerpt ?? ''),
         blocking: report.accepted ? [] : Array.from(new Set(blocking)),
+        flags,
         reason: report.quarantineReason ?? ''
       });
     }
@@ -313,6 +363,7 @@ function replayRun(run: RunRecord): ReplayResult {
       parsed: parsedItems.length,
       structurallyInvalid: parsedItems.length - valid.length,
       accepted,
+      flagged,
       quarantine,
       parseStatus: parsedResult.status,
       strategy: String(parsedResult.strategy),
@@ -323,7 +374,15 @@ function replayRun(run: RunRecord): ReplayResult {
     });
   });
 
-  return { run, chunks, items, notes };
+  if (acceptLogicMismatch > 0) {
+    notes.push(
+      `${acceptLogicMismatch} item dikarantina oleh EvidenceValidator padahal tidak ada FAIL / SUSPECT HIGH. ` +
+      `Aturan "blocking" di skrip ini tidak sama dengan evidence-validator.ts; cek logika report.accepted ` +
+      `(mungkin memakai result.pass, sehingga SUSPECT LOW ikut memblokir).`
+    );
+  }
+
+  return { run, chunks, items, notes, rawSha: rawHash.digest('hex').slice(0, 12) };
 }
 
 // ------------------------------------------------------------
@@ -331,20 +390,33 @@ function replayRun(run: RunRecord): ReplayResult {
 // ------------------------------------------------------------
 function trunc(s: string, n: number): string {
   const t = s.replace(/\s+/g, ' ').trim();
-  return t.length > n ? t.slice(0, n - 1) + '…' : t;
+  return t.length > n ? t.slice(0, n - 3) + '...' : t;
 }
 
 function pad(s: string | number, n: number): string {
   return String(s).padEnd(n);
 }
 
-function byRule(items: ItemDecision[]): Record<string, number> {
+function byRule(items: Array<{ accepted: boolean; blocking: string[] }>): Record<string, number> {
   const out: Record<string, number> = {};
   for (const it of items) {
     if (it.accepted) continue;
     for (const r of it.blocking) out[r] = (out[r] ?? 0) + 1;
   }
   return out;
+}
+
+function flagsByRule(items: Array<{ accepted: boolean; flags?: string[] }>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const it of items) {
+    if (!it.accepted) continue;
+    for (const r of it.flags ?? []) out[r] = (out[r] ?? 0) + 1;
+  }
+  return out;
+}
+
+function fmtRules(o: Record<string, number>): string {
+  return Object.keys(o).sort().map(k => `${k}=${o[k]}`).join('  ') || '-';
 }
 
 function printRun(res: ReplayResult, full: boolean, currentHash: string): void {
@@ -355,15 +427,16 @@ function printRun(res: ReplayResult, full: boolean, currentHash: string): void {
     `code_hash run=${run.code_hash ?? '-'} sekarang=${currentHash}` +
     `${run.code_hash && run.code_hash !== currentHash ? '  (KODE SUDAH BERUBAH)' : ''}`
   );
+  console.log(`  aturan assessment sekarang=${RULES_VERSION}  raw_sha=${res.rawSha}`);
   for (const n of notes) console.log(`  ! ${n}`);
 
   console.log(`  ${pad('chunk', 6)}${pad('parsed', 8)}${pad('accept', 8)}${pad('quar', 6)}${pad('parse', 22)}| asli: parsed/accept/quar -> parity`);
-  let tp = 0, ta = 0, tq = 0, allSame = true;
+  let tp = 0, ta = 0, tq = 0, tf = 0, allSame = true;
   for (const c of chunks) {
     const orig = run.chunks.find(x => x.chunk === c.chunk);
     const same = !!orig && orig.parsed === c.parsed && orig.accepted === c.accepted && orig.quarantine === c.quarantine;
     if (!same) allSame = false;
-    tp += c.parsed; ta += c.accepted; tq += c.quarantine;
+    tp += c.parsed; ta += c.accepted; tq += c.quarantine; tf += c.flagged;
     console.log(
       `  ${pad(c.chunk, 6)}${pad(c.parsed, 8)}${pad(c.accepted, 8)}${pad(c.quarantine, 6)}` +
       `${pad(`${c.parseStatus}/${c.strategy}`, 22)}| ` +
@@ -377,11 +450,12 @@ function printRun(res: ReplayResult, full: boolean, currentHash: string): void {
     for (const d of c.diagnosis) console.log(`       ${d}`);
   }
   const rate = tp > 0 ? ((tq / tp) * 100).toFixed(1) : '0.0';
-  console.log(`  TOTAL parsed=${tp} accepted=${ta} quarantine=${tq} (${rate}%)  parity keseluruhan: ${allSame ? 'SAMA' : 'BEDA'}`);
-
-  const rules = byRule(items);
-  const ruleTxt = Object.keys(rules).sort().map(k => `${k}=${rules[k]}`).join('  ') || '-';
-  console.log(`  Quarantine per aturan: ${ruleTxt}`);
+  console.log(
+    `  TOTAL parsed=${tp} accepted=${ta} (dengan flag=${tf}) quarantine=${tq} (${rate}%)  ` +
+    `parity keseluruhan: ${allSame ? 'SAMA' : 'BEDA'}`
+  );
+  console.log(`  Quarantine per aturan: ${fmtRules(byRule(items))}`);
+  console.log(`  Diterima dengan flag per aturan: ${fmtRules(flagsByRule(items))}`);
 
   const quar = items.filter(i => !i.accepted);
   const shown = full ? quar : quar.slice(0, 40);
@@ -392,51 +466,142 @@ function printRun(res: ReplayResult, full: boolean, currentHash: string): void {
   if (!full && quar.length > shown.length) {
     console.log(`  ... ${quar.length - shown.length} item lagi (gunakan --full)`);
   }
+  if (full) {
+    const flg = items.filter(i => i.accepted && i.flags.length > 0);
+    if (flg.length > 0) console.log(`  -- diterima dengan flag (${flg.length}) --`);
+    for (const f of flg) {
+      console.log(`  [c${f.chunk}#${f.pos}] flag=${f.flags.join('+')} | ${f.type} | ${trunc(f.claim, 70)}`);
+    }
+  }
 }
 
 function printAllTable(results: ReplayResult[]): void {
   console.log('='.repeat(78));
-  console.log('RINGKASAN SEMUA RUN (hasil replay dengan kode SAAT INI)');
-  console.log(`${pad('run', 21)}${pad('review', 13)}${pad('parsed', 8)}${pad('accept', 8)}${pad('quar', 6)}${pad('rasio', 8)}${pad('gagal-parse', 12)}aturan`);
+  console.log(`RINGKASAN SEMUA RUN (hasil replay dengan kode SAAT INI, aturan assessment=${RULES_VERSION})`);
+  console.log(`${pad('run', 21)}${pad('review', 13)}${pad('parsed', 8)}${pad('accept', 8)}${pad('flag', 6)}${pad('quar', 6)}${pad('rasio', 8)}${pad('gagal-parse', 12)}aturan`);
   const totalRules: Record<string, number> = {};
+  const totalFlags: Record<string, number> = {};
   for (const r of results) {
     const tp = r.chunks.reduce((s, c) => s + c.parsed, 0);
     const tq = r.chunks.reduce((s, c) => s + c.quarantine, 0);
     const ta = r.chunks.reduce((s, c) => s + c.accepted, 0);
+    const tf = r.chunks.reduce((s, c) => s + c.flagged, 0);
     const rules = byRule(r.items);
     for (const k of Object.keys(rules)) totalRules[k] = (totalRules[k] ?? 0) + rules[k];
-    const ruleTxt = Object.keys(rules).sort().map(k => `${k}=${rules[k]}`).join(' ') || '-';
+    const fl = flagsByRule(r.items);
+    for (const k of Object.keys(fl)) totalFlags[k] = (totalFlags[k] ?? 0) + fl[k];
     console.log(
       `${pad(r.run.run_id.slice(0, 19), 21)}${pad(String(r.run.review_id ?? '-').slice(0, 11), 13)}` +
-      `${pad(tp, 8)}${pad(ta, 8)}${pad(tq, 6)}${pad(tp ? ((tq / tp) * 100).toFixed(1) + '%' : '-', 8)}` +
-      `${pad(r.chunks.filter(c => c.parseStatus === 'FAILED').length + '/' + r.chunks.length, 12)}${ruleTxt}`
+      `${pad(tp, 8)}${pad(ta, 8)}${pad(tf, 6)}${pad(tq, 6)}${pad(tp ? ((tq / tp) * 100).toFixed(1) + '%' : '-', 8)}` +
+      `${pad(r.chunks.filter(c => c.parseStatus === 'FAILED').length + '/' + r.chunks.length, 12)}${fmtRules(rules)}`
     );
   }
-  console.log(`Total per aturan: ${Object.keys(totalRules).sort().map(k => `${k}=${totalRules[k]}`).join('  ') || '-'}`);
+  console.log(`Total karantina per aturan: ${fmtRules(totalRules)}`);
+  console.log(`Total diterima dengan flag per aturan: ${fmtRules(totalFlags)}`);
 }
 
-function printDiff(res: ReplayResult, prevPath: string): void {
-  const prev = JSON.parse(fs.readFileSync(prevPath, 'utf8')) as { run_id?: string; items: ItemDecision[] };
-  const before = new Map(prev.items.map(i => [i.key, i]));
-  const after = new Map(res.items.map(i => [i.key, i]));
-  let flips = 0;
-  console.log('-'.repeat(78));
-  console.log(`DIFF terhadap ${prevPath}${prev.run_id && prev.run_id !== res.run.run_id ? `  (run simpanan berbeda: ${prev.run_id})` : ''}`);
-  for (const [key, a] of after) {
-    const b = before.get(key);
-    if (!b) { flips++; console.log(`  + BARU  [${key}] ${a.accepted ? 'accepted' : 'quarantine'} | ${trunc(a.claim, 80)}`); continue; }
-    if (a.accepted !== b.accepted) {
-      flips++;
-      console.log(
-        `  ${a.accepted ? '↑ LOLOS ' : '↓ DIKARANTINA'} [${key}] ` +
-        `${b.blocking.join('+') || 'accepted'} -> ${a.blocking.join('+') || 'accepted'} | ${trunc(a.claim, 80)}`
-      );
+// ------------------------------------------------------------
+// Diff sebelum/sesudah
+// ------------------------------------------------------------
+function loadSaved(p: string): SavedRun[] {
+  const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as SavedRun | SavedRun[];
+  return Array.isArray(raw) ? raw : [raw];
+}
+
+function printDiff(results: ReplayResult[], prevPath: string, full: boolean, currentHash: string): void {
+  const saved = loadSaved(prevPath);
+  const byId = new Map(saved.map(s => [s.run_id ?? '', s]));
+
+  const transitions = new Map<string, number>();
+  const ruleBefore: Record<string, number> = {};
+  const ruleAfter: Record<string, number> = {};
+  const tally = { before: { diterima: 0, 'diterima+flag': 0, karantina: 0 }, after: { diterima: 0, 'diterima+flag': 0, karantina: 0 } };
+  const flips: string[] = [];
+  let compared = 0, inputSame = 0, inputDiff = 0, inputUnknown = 0, missingRuns = 0;
+  const beforeVersions = new Set<string>();
+  const beforeHashes = new Set<string>();
+
+  console.log('='.repeat(78));
+  console.log(`DIFF SEBELUM/SESUDAH terhadap ${prevPath}`);
+
+  for (const res of results) {
+    const prev = byId.get(res.run.run_id) ?? (saved.length === 1 && !saved[0].run_id ? saved[0] : undefined);
+    if (!prev) { missingRuns++; console.log(`  ? ${res.run.run_id}: tidak ada di file simpanan, dilewati`); continue; }
+    compared++;
+    beforeVersions.add(prev.rules_version ?? 'legacy/tidak-tercatat');
+    if (prev.code_hash) beforeHashes.add(prev.code_hash);
+
+    if (prev.raw_sha && res.rawSha !== '-') {
+      if (prev.raw_sha === res.rawSha) inputSame++;
+      else { inputDiff++; console.log(`  ! ${res.run.run_id}: raw_sha BEDA (${prev.raw_sha} vs ${res.rawSha}) - file raw berubah, bukan apple-to-apple`); }
+    } else {
+      inputUnknown++;
+    }
+
+    const before = new Map(prev.items.map(i => [i.key, i]));
+    const after = new Map(res.items.map(i => [i.key, i]));
+    for (const i of prev.items) { tally.before[outcomeOf(i)]++; }
+    for (const i of res.items) { tally.after[outcomeOf(i)]++; }
+    for (const [r, n] of Object.entries(byRule(prev.items))) ruleBefore[r] = (ruleBefore[r] ?? 0) + n;
+    for (const [r, n] of Object.entries(byRule(res.items))) ruleAfter[r] = (ruleAfter[r] ?? 0) + n;
+
+    const tag = `${res.run.run_id.slice(11, 16)}_${String(res.run.review_id ?? '-').slice(0, 6)}`;
+    for (const [key, a] of after) {
+      const b = before.get(key);
+      if (!b) { flips.push(`  + BARU   [${tag} ${key}] ${outcomeOf(a)} | ${trunc(a.claim, 70)}`); continue; }
+      const from = outcomeOf(b);
+      const to = outcomeOf(a);
+      if (from !== to) {
+        const k = `${from} -> ${to}`;
+        transitions.set(k, (transitions.get(k) ?? 0) + 1);
+        flips.push(
+          `  ${from} -> ${to}  [${tag} ${key}] ${b.blocking.join('+') || b.flags.join('+') || '-'} => ` +
+          `${a.blocking.join('+') || a.flags.join('+') || '-'} | ${a.type} | ${trunc(a.claim, 60)}`
+        );
+      }
+    }
+    for (const [key, b] of before) {
+      if (!after.has(key)) flips.push(`  - HILANG [${tag} ${key}] | ${trunc(b.claim, 70)}`);
     }
   }
-  for (const [key, b] of before) {
-    if (!after.has(key)) { flips++; console.log(`  - HILANG [${key}] | ${trunc(b.claim, 80)}`); }
+
+  console.log(`  SEBELUM: aturan=${Array.from(beforeVersions).join(',') || '-'}  code_hash=${Array.from(beforeHashes).join(',') || '-'}`);
+  console.log(`  SESUDAH: aturan=${RULES_VERSION}  code_hash=${currentHash}`);
+  console.log(`  Run dibandingkan: ${compared}${missingRuns ? ` (tidak ada di simpanan: ${missingRuns})` : ''}`);
+  if (inputDiff > 0) {
+    console.log(`  !! INPUT BERBEDA pada ${inputDiff} run: perbandingan ini BUKAN apple-to-apple.`);
+  } else if (inputUnknown > 0 && inputSame === 0) {
+    console.log('  ?  raw_sha tidak tercatat di simpanan (dibuat replay-run versi lama): kesamaan input tidak terverifikasi.');
+  } else {
+    console.log(`  INPUT IDENTIK (raw_sha sama pada ${inputSame} run${inputUnknown ? `; ${inputUnknown} run tanpa raw_sha` : ''}): selisih berasal dari kode/aturan saja.`);
   }
-  console.log(flips === 0 ? '  (tidak ada perubahan keputusan)' : `  Total perubahan: ${flips}`);
+
+  const sum = (t: Record<string, number>) => t.diterima + t['diterima+flag'] + t.karantina;
+  console.log('');
+  console.log(`  ${pad('', 18)}${pad('sebelum', 10)}${pad('sesudah', 10)}`);
+  for (const k of ['diterima', 'diterima+flag', 'karantina'] as const) {
+    console.log(`  ${pad(k, 18)}${pad(tally.before[k], 10)}${pad(tally.after[k], 10)}`);
+  }
+  console.log(`  ${pad('total item', 18)}${pad(sum(tally.before), 10)}${pad(sum(tally.after), 10)}`);
+
+  const rules = Array.from(new Set([...Object.keys(ruleBefore), ...Object.keys(ruleAfter)])).sort();
+  if (rules.length > 0) {
+    console.log('');
+    console.log(`  Karantina per aturan: ${pad('sebelum', 10)}${pad('sesudah', 10)}`);
+    for (const r of rules) console.log(`    ${pad(r, 20)}${pad(ruleBefore[r] ?? 0, 10)}${pad(ruleAfter[r] ?? 0, 10)}`);
+  }
+
+  if (transitions.size > 0) {
+    console.log('');
+    console.log('  Perpindahan keputusan:');
+    for (const [k, n] of Array.from(transitions).sort((a, b) => b[1] - a[1])) console.log(`    ${pad(k, 34)}${n}`);
+  }
+
+  const shown = full ? flips : flips.slice(0, 40);
+  if (shown.length > 0) console.log('');
+  for (const f of shown) console.log(f);
+  if (!full && flips.length > shown.length) console.log(`  ... ${flips.length - shown.length} perubahan lagi (gunakan --full)`);
+  if (flips.length === 0) console.log('\n  (tidak ada perubahan keputusan)');
 }
 
 // ------------------------------------------------------------
@@ -493,20 +658,25 @@ function main(): void {
 
   const jsonOut = valueOf('--json');
   if (jsonOut) {
-    const payload = results.length === 1
-      ? { run_id: results[0].run.run_id, code_hash: currentHash, items: results[0].items }
-      : results.map(r => ({ run_id: r.run.run_id, code_hash: currentHash, items: r.items }));
+    const toSaved = (r: ReplayResult): SavedRun => ({
+      run_id: r.run.run_id,
+      code_hash: currentHash,
+      rules_version: RULES_VERSION,
+      raw_sha: r.rawSha,
+      items: r.items
+    });
+    const payload = results.length === 1 ? toSaved(results[0]) : results.map(toSaved);
     fs.writeFileSync(jsonOut, JSON.stringify(payload, null, 2), 'utf8');
-    console.log(`\nKeputusan per item disimpan ke ${jsonOut}`);
+    console.log(`\nKeputusan per item disimpan ke ${jsonOut} (aturan=${RULES_VERSION}, code_hash=${currentHash})`);
   }
 
   const diffIn = valueOf('--diff');
   if (diffIn) {
-    if (results.length !== 1) {
-      console.error('--diff hanya untuk satu run (hindari --all).');
+    if (!fs.existsSync(diffIn)) {
+      console.error(`File simpanan tidak ditemukan: ${diffIn}`);
       process.exit(1);
     }
-    printDiff(results[0], diffIn);
+    printDiff(results, diffIn, flag('--full'), currentHash);
   }
 }
 
