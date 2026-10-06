@@ -21,6 +21,10 @@
 //                   (5) type di-trim; placeholder "null"/"none"/"n/a"/"-" pada
 //                       reviewer_assessment dianggap kosong.
 //
+//   assessment-v2.1: hanya field `pass` yang berubah: SUSPECT LOW kini pass:true
+//                   (konvensi atomicity.ts: SUSPECT non-blocking = pass:true; HIGH = false).
+//                   Keputusan accepted/quarantine TIDAK berubah (diverifikasi replay).
+//
 // Mengapa LOW dan bukan retype ke OPINION: OPINION wajib punya
 // reviewer_assessment (aturan 1 di bawah). Mengubah type tanpa mengarang
 // polaritas hanya memindahkan item ke karantina yang sama. Item tetap diterima
@@ -29,7 +33,7 @@
 
 import type { ValidationResult } from '../types';
 
-export const ASSESSMENT_RULES_VERSION = 'assessment-v2';
+export const ASSESSMENT_RULES_VERSION = 'assessment-v2.1';
 
 const ALLOWED_TYPES_FOR_ASSESSMENT = ['OPINION'];
 
@@ -178,7 +182,7 @@ export const AssessmentValidator = {
             ? ' (kata hanya ada di source_excerpt; ditandai saja)'
             : ' (ditandai saja, tidak memblokir)';
         }
-        return { pass: false, status: 'SUSPECT', rule: 'ASSESSMENT', reason, severity };
+        return { pass: !blocks, status: 'SUSPECT', rule: 'ASSESSMENT', reason, severity };
       }
     }
 
