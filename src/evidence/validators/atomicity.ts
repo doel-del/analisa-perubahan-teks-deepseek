@@ -15,6 +15,20 @@
 
 import type { ValidationResult } from '../types';
 
+// Rentang non-dash ("30 hingga 45 fps", "40 sampai ke 50 cm", "3 hingga 4 juta").
+// Rentang non-dash ("30 hingga 45 fps", "40 sampai ke 50 cm", "3 hingga 4 juta").
+// Rentang gb/mb SENGAJA tidak dibuang (selaras value.ts N17): "8 hingga 256 GB"
+// lebih mungkin dua spek berbeda daripada rentang sungguhan.
+// Hardening: satuan boleh muncul setelah angka PERTAMA juga ("30 fps hingga 45 fps",
+// "30 fps - 45 fps"); versi awal hanya mengenali satuan setelah angka kedua.
+const RANGE_UNITS =
+  'fps|mp|hz|nits|watt|mah|cm|mm|juta|ribu|derajat(?:\\s+celsius)?|jam|menit|detik|kali|tahun|%';
+const RANGE_RE = new RegExp(
+  `\\b\\d+(?:[.,]\\d+)?(?:\\s*(?:${RANGE_UNITS}))?\\s*(?:[–-]|hingga|sampai(?:\\s+ke)?|s\\/d)\\s*` +
+  `\\d+(?:[.,]\\d+)?\\b(?!\\s*(?:gb|mb)\\b)(?:\\s*(?:${RANGE_UNITS}))?`,
+  'gi'
+);
+
 export const AtomicityValidator = {
   validate(claim: string | undefined): ValidationResult {
     const normalizedClaim = (claim || '').toLowerCase();
@@ -175,6 +189,27 @@ export const AtomicityValidator = {
       };
     }
 
+    // N3b: "setting/mode X dan frame rate <apa pun> ..." = kondisi uji, bukan nilai kedua.
+    // PASS hanya bila, setelah fragmen konfigurasi dibuang, tidak ada " dan " maupun
+    // comma-list tersisa (supaya compound lain di klaim yang sama, mis. "... dan suhu
+    // 38 derajat" atau ", baterai 5000 mAh, layar 6,7 inci", tetap tertangkap).
+    // Hardening: bagian tengah fragmen TIDAK boleh memuat " dan " lain; versi awal
+    // (lazy [^.!?]*?) bisa menelan "dan suhu 38 derajat" ke dalam fragmen konfigurasi.
+    const configThenMeasurePattern =
+      /\b(?:setting|settingan|pengaturan|mode|preset)\b(?:(?!\bdan\b)[^.!?])*?\bdan\b\s+(?:frame rate|fps|refresh rate)\s+\w+\b/i;
+    const claimMinusConfig = normalizedClaim.replace(configThenMeasurePattern, ' ');
+    if (
+      configThenMeasurePattern.test(normalizedClaim) &&
+      !/\s+dan\s+/i.test(claimMinusConfig) &&
+      !/,[^,]{1,80},/.test(claimMinusConfig)
+    ) {
+      return { pass: true, status: 'PASS', rule: 'ATOMICITY', severity: 'LOW' };
+    }
+
+    // Rentang dihitung SATU nilai: buang sebelum mendeteksi multi-value / hitung angka.
+    const claimNoRange = normalizedClaim.replace(RANGE_RE, ' rentang ');
+    const rangeCount = (normalizedClaim.match(RANGE_RE) ?? []).length;
+
     // ------------------------------------------------------------
     // 2. BUKTI COMPOUND KUAT
     // ------------------------------------------------------------
@@ -192,9 +227,9 @@ export const AtomicityValidator = {
     // Contoh: "X, Y, Z"
     const commaListSimplePattern = /,[^,]{1,80},/;
 
-    const hasMultiValue = multiValuePattern.test(normalizedClaim);
-    const hasCommaList3Plus = commaList3PlusPattern.test(normalizedClaim);
-    const hasCommaListSimple = commaListSimplePattern.test(normalizedClaim);
+    const hasMultiValue = multiValuePattern.test(claimNoRange);
+    const hasCommaList3Plus = commaList3PlusPattern.test(claimNoRange);
+    const hasCommaListSimple = commaListSimplePattern.test(claimNoRange);
 
     // ------------------------------------------------------------
     // 3. WHITELIST RETURN — klaim atomic yang sah
@@ -255,8 +290,8 @@ export const AtomicityValidator = {
     // Comma-list 3+ item DAN ada angka/unit → compound genuine
     const hasNumberOrUnit =
       /\b\d+(?:[.,]\d+)?\s*(meter|menit|jam|detik|mm|nm|gb|mb|kali|tahun|fps|mp|watt|mah|hz|ribu|juta|%)\b/i.test(
-        normalizedClaim
-      ) || /\b\d+\b/.test(normalizedClaim);
+        claimNoRange
+      ) || /\b\d+\b/.test(claimNoRange) || rangeCount > 0;
 
     if (hasCommaList3Plus && hasNumberOrUnit) {
       return {
@@ -284,7 +319,7 @@ export const AtomicityValidator = {
     // ("perlu review manual", tetap diterima) alih-alih salah HIGH
     // (quarantine).
     const compoundDescriptorPattern = /\b(?:4k|8k|2k|\d{3,4}p)\s+\d+\s*fps\b/gi;
-    const claimWithoutCompoundDescriptors = normalizedClaim.replace(
+    const claimWithoutCompoundDescriptors = claimNoRange.replace(
       compoundDescriptorPattern,
       ''
     );
@@ -293,7 +328,7 @@ export const AtomicityValidator = {
       const numberMatches =
         // normalizedClaim.match(/\b\d+(?:[.,]\d+)?/g) || [];
         claimWithoutCompoundDescriptors.match(/\b\d+(?:[.,]\d+)?/g) || [];
-      if (numberMatches.length >= 2) {
+      if (numberMatches.length + rangeCount >= 2) {
         return {
           pass: false,
           status: 'SUSPECT',
