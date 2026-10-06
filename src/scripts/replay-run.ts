@@ -390,7 +390,7 @@ function replayRun(run: RunRecord): ReplayResult {
 // ------------------------------------------------------------
 function trunc(s: string, n: number): string {
   const t = s.replace(/\s+/g, ' ').trim();
-  return t.length > n ? t.slice(0, n - 3) + '...' : t;
+  return t.length > n ? t.slice(0, n - 1) + '…' : t;
 }
 
 function pad(s: string | number, n: number): string {
@@ -533,7 +533,7 @@ function printDiff(results: ReplayResult[], prevPath: string, full: boolean, cur
 
     if (prev.raw_sha && res.rawSha !== '-') {
       if (prev.raw_sha === res.rawSha) inputSame++;
-      else { inputDiff++; console.log(`  ! ${res.run.run_id}: raw_sha BEDA (${prev.raw_sha} vs ${res.rawSha}) - file raw berubah, bukan apple-to-apple`); }
+      else { inputDiff++; console.log(`  ! ${res.run.run_id}: raw_sha BEDA (${prev.raw_sha} vs ${res.rawSha}) — file raw berubah, bukan apple-to-apple`); }
     } else {
       inputUnknown++;
     }
@@ -555,8 +555,9 @@ function printDiff(results: ReplayResult[], prevPath: string, full: boolean, cur
         const k = `${from} -> ${to}`;
         transitions.set(k, (transitions.get(k) ?? 0) + 1);
         flips.push(
-          `  ${from} -> ${to}  [${tag} ${key}] ${b.blocking.join('+') || b.flags.join('+') || '-'} => ` +
-          `${a.blocking.join('+') || a.flags.join('+') || '-'} | ${a.type} | ${trunc(a.claim, 60)}`
+          // `flags` bisa tidak ada pada simpanan format lama (sebelum kategori diterima+flag).
+          `  ${from} -> ${to}  [${tag} ${key}] ${(b.blocking ?? []).join('+') || (b.flags ?? []).join('+') || '-'} => ` +
+          `${(a.blocking ?? []).join('+') || (a.flags ?? []).join('+') || '-'} | ${a.type} | ${trunc(a.claim, 60)}`
         );
       }
     }
