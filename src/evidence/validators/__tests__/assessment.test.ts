@@ -333,6 +333,6 @@ describe('ASSESSMENT VALIDATOR: celah yang diketahui (false positive, hanya flag
 
 describe('ASSESSMENT VALIDATOR: versi aturan', () => {
   test('label versi (naikkan bersama perubahan perilaku + catat di riwayat versi)', () => {
-    expect(ASSESSMENT_RULES_VERSION).toBe('assessment-v2');
+    expect(ASSESSMENT_RULES_VERSION).toBe('assessment-v2.1');
   });
 });
