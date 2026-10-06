@@ -32,6 +32,8 @@ import {
 // IMPOR VALIDATOR LAYER PHASE A & B
 // ==========================================
 import { EvidenceValidator } from './src/evidence/validators/evidence-validator';
+// Namespace import: tetap jalan bila assessment.ts belum punya ASSESSMENT_RULES_VERSION (dicatat 'legacy').
+import * as assessmentRules from './src/evidence/validators/assessment';
 import { DuplicateValidator } from './src/evidence/validators/duplicate';
 import type { DuplicateResult } from './src/evidence/validators/duplicate';
 import type {
@@ -228,6 +230,11 @@ function readGitInfo(): { git_commit: string; git_dirty: boolean | null } {
 }
 
 // Dihitung sekali saat server start.
+// Label versi aturan ASSESSMENT (lihat riwayat versi di assessment.ts). Dicatat di tiap run
+// supaya run dengan kebijakan berbeda tidak dibandingkan seolah apple-to-apple.
+const RULES_VERSION: string =
+  (assessmentRules as unknown as { ASSESSMENT_RULES_VERSION?: string }).ASSESSMENT_RULES_VERSION ?? 'legacy';
+
 const RUN_FINGERPRINT = {
   ...readGitInfo(),
   code_hash: computeCodeHash(),
@@ -244,6 +251,8 @@ interface ChunkRunRecord {
   status: 'OK' | 'EMPTY' | 'FAILED' | 'PARSE_FAILED';
   // Jumlah field berisi string kosong/"null" yang dinormalisasi ke null.
   nullish_normalized?: number;
+  // Dari accepted: berapa yang membawa aturan non-PASS yang tidak memblokir (SUSPECT LOW/MEDIUM).
+  flagged?: number;
   // Terisi bila JSON rusak dan parser memakai penyelamatan per objek.
   salvage?: { recovered: number; repaired: number; skipped: number; truncated: boolean };
   error?: string;
@@ -291,6 +300,10 @@ function logRunLine(
     structurally_invalid: stats.structurallyInvalidCount,
     validator_accepted: stats.validatorAcceptedCount,
     quarantine: stats.quarantineCount,
+    // Diterima tetapi ditandai (aturan non-PASS tidak memblokir). Sejak assessment-v2 angka karantina
+    // saja tidak lagi mengukur ketegasan gatekeeper; pantau juga angka ini.
+    accepted_flagged: runInfo.chunks.reduce((n, c) => n + (c.flagged ?? 0), 0),
+    rules_version: RULES_VERSION,
 
     // Duplicate funnel.
     duplicate_removed: stats.duplicateRemovedCount,
@@ -561,6 +574,7 @@ async function extractEvidence(
       }
 
       let nullishFixed = 0;
+      let flaggedCount = 0;
       for (const ev of structurallyValidEvidence) {
         const context: EvidenceContext = {
           chunkIndex,
@@ -608,6 +622,8 @@ async function extractEvidence(
 
         if (report.accepted) {
           validatorAcceptedCount++;
+          // Diterima tetapi membawa aturan non-PASS yang tidak memblokir (mis. ASSESSMENT SUSPECT LOW).
+          if (report.results.some(r => r.status !== 'PASS')) flaggedCount++;
 
           allEvidence.push({
             // ...ev,
@@ -641,6 +657,7 @@ async function extractEvidence(
       }
 
       rec.status = 'OK';
+      rec.flagged = flaggedCount;
       rec.accepted = allEvidence.length - accStart;
       rec.quarantine = quarantinedEvidence.length - quarStart;
       console.log(`✅ Chunk ke-${batchNumber} selesai. Total valid: ${allEvidence.length}, Quarantine: ${quarantinedEvidence.length}`);
