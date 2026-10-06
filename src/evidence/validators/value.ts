@@ -101,9 +101,17 @@ export const ValueValidator = {
     // genuine range storage di produksi, tangani lewat whitelist
     // literal terpisah, bukan dengan melebarkan pattern unit ini.
     // ------------------------------------------------------------
+    //
+    // PERLUASAN (replay 15 video): daftar unit putih (fps|mp|hz|nits|watt|mah)
+    // melewatkan rentang berunit lain yang sama sahnya -- "40-50 cm" (jarak),
+    // "30-35 %" (volume). Dibalik menjadi daftar HITAM: rentang diterima untuk
+    // satuan apa pun KECUALI kapasitas penyimpanan (gb/mb/tb), alasannya sama
+    // dengan catatan di atas. Selaras dengan RANGE_RE di atomicity.ts.
+    // Desimal koma ("1,5-2") ikut diterima.
     if (
-      /^\d+\s*[–-]\s*\d+$/.test(valueStr) &&
-      /^(fps|mp|hz|nits|watt|mah)$/i.test(unitStr)
+      /^\d+(?:[.,]\d+)?\s*[–-]\s*\d+(?:[.,]\d+)?$/.test(valueStr) &&
+      unitStr !== '' &&
+      !/^(gb|mb|tb)$/i.test(unitStr)
     ) {
       return { pass: true, status: 'PASS', rule: 'VALUE', severity: 'LOW' };
     }
@@ -188,6 +196,8 @@ export const ValueValidator = {
   }
 };
 
+// Desimal Indonesia memakai koma ("1,5 jam"); format titik juga diterima.
+// Sebelumnya hanya titik, sehingga "1,5" + "jam" dikarantina sebagai non-numerik.
 function isNumeric(str: string): boolean {
-  return /^-?\d+(\.\d+)?$/.test(str);
+  return /^-?\d+([.,]\d+)?$/.test(str);
 }
